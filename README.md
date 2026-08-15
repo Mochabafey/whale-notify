@@ -135,13 +135,22 @@ $DSH_HOME\profiles\node_modules\
 
 **前提**：本机运行 [NapCat](https://github.com/NapNeko/NapCatQQ)（登录一个 QQ 号），HTTP API 默认 `http://127.0.0.1:3000`。
 
+**NapCat 安装（Windows，用已安装的 QQ）**：
+
+1. 从 [Releases](https://github.com/NapNeko/NapCatQQ/releases) 下载 **`NapCat.Shell.zip`**（不是 OneKey 版——OneKey 会自动下载 QQ 且易 404；Shell 版直接挂载已装的 QQ）
+2. 解压后，确保 QQ NT 版已安装（`C:\Program Files\Tencent\QQNT\`）
+3. 双击 **`launcher-user.bat`**（用户版，无需管理员）启动；首次会拉起 QQ 登录
+4. 登录后 NapCat 自动运行，`config/onebot11_<QQ号>.json` 会生成
+5. **编辑 `onebot11_<QQ号>.json`** 启用 OneBot：`network.httpServers` 加 HTTP 3000，`network.websocketClients` 加 `ws://127.0.0.1:3001`（连插件反向 WS）
+6. 重启 NapCat 生效
+
 **配置**：
 
 ```yaml
     qq:
       httpBase: 'http://127.0.0.1:3000'   # OneBot HTTP API
       accessToken: ''                     # OneBot 访问令牌（可选）
-      qq: '123456789'                         # 私聊目标 QQ 号
+      qq: '123456789'                     # 私聊目标 QQ 号
       groupId: ''                         # 或填群号（二选一，优先群）
       wsPort: 3001                        # 本插件监听反向 WS 的端口
       targetSession: ''                   # 可选：QQ 消息注入哪个 DSH 会话
@@ -237,6 +246,27 @@ $DSH_HOME\profiles\node_modules\
 ```
 
 重启 DSH 后生效。**密钥永远不会写进任何配置文件**。
+
+## 🔐 访问控制（黑白名单）
+
+只有你（或你指定的人）能通过飞书/QQ 指挥鲸鱼娘，其他人发消息**无反应**（不注入会话，仅记日志）。
+
+```yaml
+    accessControl:
+      mode: 'whitelist'                     # whitelist=仅白名单可指挥；open=所有人（默认）
+      allowedUsers:
+        feishu:
+          - 'ou_xxxxxxxxxxxxxxxx'           # 你的飞书 open_id（收到消息后从日志中可看到）
+        qq:
+          - '123456789'                     # 你的 QQ 号
+      readOnlyUsers:
+        feishu: []
+        qq: []                              # 只读用户：可发消息但 agent 标记为只读，不执行修改操作
+```
+
+- **白名单用户**：可正常下达指令
+- **只读用户**：消息注入但带 `[只读消息]` 标记，agent 不执行修改性操作
+- **名单外用户**：消息被忽略（无反应），记录 `qq_denied` / `feishu_denied` 日志
 
 ## 💬 飞书双向聊天（核心玩法）
 
