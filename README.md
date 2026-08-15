@@ -37,7 +37,8 @@ whale-notify/
 │   ├── 会话内配置.md                   # settings 工具与模式切换
 │   └── 外部服务配置.md                 # NapCat / 飞书 / 邮箱配置
 ├── examples/
-│   └── agent.cordis.whale.yml         # 脱敏的 preset 配置示例
+│   ├── agent.cordis.whale.yml         # 脱敏的 preset 组合配置示例
+│   └── preset.yml                     # 鲸鱼娘 preset 元数据示例（人设介绍）
 ├── plugins/
 │   └── dsh-whale-notify/              # 鲸鱼通知插件
 │       ├── package.json
