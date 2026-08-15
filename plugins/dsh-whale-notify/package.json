@@ -1,0 +1,22 @@
+{
+  "name": "dsh-whale-notify",
+  "displayName": "鲸鱼通知",
+  "description": "鲸鱼通知：任务完成通知 + 邮件问答/回复指挥（支持微信 Server酱、飞书、企业微信、钉钉、邮件 SMTP/IMAP），零第三方运行时依赖",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
+  }
+}

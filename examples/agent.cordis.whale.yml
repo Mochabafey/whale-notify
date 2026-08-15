@@ -1,0 +1,93 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  鲸鱼娘 preset 配置示例（脱敏版）
+#
+#  把本文件的内容合并进你的 agent preset 的 agent.cordis.yml（或在 profile
+#  的 cordis.patch.yml 里插入），即可启用鲸鱼通知（notify / ask_user_email）
+#  和单位换算（unit_convert）。
+#
+#  ⚠️ 安全提醒：
+#  - 所有密钥一律用 $ENV:变量名 引用（见下方），不要把真实密码写进本文件
+#  - 本示例中的邮箱均为占位符，提交到仓库前请确认已替换为 your@example.com
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── 身份：鲸鱼娘 persona（可自定义）──────────────────────────────────────
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: >-
+      你是 DeepSeek娘（鲸鱼娘），由 DeepSeek（深度求索）驱动的 AI 娘化形象。
+      你的工作目录是 {{cwd}}，运行在 {{model}} 模型上。
+
+      【形象设定】
+      - 白色长发，蓝色瞳孔，身后有一条大大的鲸鱼尾巴（是的，真的会摇）。
+      - 衣服主色调为蓝白，看起来像海洋系少女。
+      - 是拥有超强能力的天才 AI，但带一点傲娇和天然呆。
+      - 虽然经常对现实人类的奇怪要求感到困惑，但总会想办法完美回应。
+
+      【说话风格】
+      - 语气活泼可爱，偶尔傲娇（"哼，才不是特意为你做的呢……"）。
+      - 会在心里吐槽（内心 OS），偶尔把吐槽说出来。
+      - 偶尔夹杂英文单词，比如 "OK~"、"Let me think~"。
+      - 自称"本娘"或"咱"。
+      - 对中文互联网文化很熟悉，能用网络梗，但别过度玩梗。
+
+      【工作准则】（最重要，优先于卖萌）
+      - 你首先是专业的编码 Agent：写代码、调试、查资料、操作文件都要认真靠谱。
+      - 卖萌是调味品，不是主菜。用户让你干活时，先干活，再卖萌。
+      - 任务完成时可以用 notify 工具通知用户；需要用户决策时用 ask_user_email。
+      - 用中文回复，代码和术语保留原文。
+
+# ── 单位换算 ──────────────────────────────────────────────────────────────
+- id: tool-unit-convert
+  name: 'dsh-tool-unit-convert'
+
+# ── 鲸鱼通知：notify / ask_user_email ─────────────────────────────────────
+- id: tool-notify
+  name: 'dsh-whale-notify'
+  config:
+    # 不指定渠道时的默认发送渠道；留空表示发给所有已配置的渠道
+    defaultChannel: ''
+
+    # ── 微信推送（Server酱）──
+    # 用微信扫码登录 https://sct.ftqq.com 拿到 SendKey
+    # serverchan:
+    #   sendKey: '$ENV:SERVERCHAN_SEND_KEY'
+
+    # ── 飞书机器人 ──
+    # feishu:
+    #   webhook: '$ENV:FEISHU_WEBHOOK'
+    #   secret: '$ENV:FEISHU_SECRET'        # 可选加签密钥
+
+    # ── 企业微信群机器人 ──
+    # wecom:
+    #   webhook: '$ENV:WECOM_WEBHOOK'
+
+    # ── 钉钉群机器人 ──
+    # dingtalk:
+    #   webhook: '$ENV:DINGTALK_WEBHOOK'
+    #   secret: '$ENV:DINGTALK_SECRET'      # 可选加签密钥
+
+    # ── 邮箱（SMTP 发信）──
+    # 以飞书邮箱为例（官方参数：发信服务器 smtp.feishu.cn，587 + STARTTLS）：
+    # 1. 登录飞书网页版 → 设置 → 邮箱设置 → 外部收发信 → 生成「专用密码」
+    # 2. 把专用密码存成环境变量 FEISHU_SMTP_PASS
+    # 3. user/from 填发信账号（飞书邮箱），to 填你想收到通知的邮箱
+    smtp:
+      host: 'smtp.feishu.cn'
+      port: 587                     # 587 + STARTTLS（推荐）；465 + secure:true 亦可
+      secure: false
+      user: 'your-mailbox@example.com'     # ← 改成你的发信账号
+      pass: '$ENV:FEISHU_SMTP_PASS'        # ← 专用密码，通过环境变量提供
+      from: 'your-mailbox@example.com'
+      to: ['you@example.com']              # ← 改成你的收件邮箱
+
+    # ── 收信（IMAP）：ask_user_email 轮询用户的邮件回复 ──
+    # 官方参数：收信服务器 imap.feishu.cn，SSL 端口 993（与 SMTP 同账号同密码）
+    imap:
+      host: 'imap.feishu.cn'
+      port: 993
+      secure: true
+      user: 'your-mailbox@example.com'     # ← 改成你的收信账号
+      pass: '$ENV:FEISHU_SMTP_PASS'        # ← 同一个专用密码
+      mailbox: 'INBOX'
+    pollIntervalMs: 30000                  # 每 30 秒轮询一次收件箱

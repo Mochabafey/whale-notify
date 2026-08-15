@@ -1,0 +1,570 @@
+import z from "@deepseek-ai/schemastery";
+import { defineTool } from "@deepseek-ai/dsh-tools";
+import { createHmac, randomUUID } from "node:crypto";
+import { appendFile, mkdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { sendEmail } from "./smtp.js";
+import { registerPending, pollAndInject, decisionTag } from "./ask.js";
+
+/** Append one JSONL record to $DSH_HOME/logs/notify.log (creates dir/file). */
+async function appendLog(record) {
+  const home = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? ".", ".dsh");
+  const dir = join(home, "logs");
+  await mkdir(dir, { recursive: true });
+  await appendFile(join(dir, "notify.log"), `${JSON.stringify(record)}\n`, "utf8");
+}
+
+/**
+ * @module dsh-whale-notify
+ *
+ * Model-facing `notify` tool. Sends a completion/status message through one
+ * or more configured channels: WeChat (ServerChan), Feishu, WeCom, DingTalk,
+ * and email (SMTP). All transport uses the host runtime's native `fetch` and
+ * `node:net`/`node:tls` — no runtime dependencies beyond the DSH tool
+ * registry and cordis.
+ */
+
+const name = "tool-notify";
+// timer 是 host 层服务（dsh-base 提供）；邮件回复轮询（ctx.interval）需要注入它。
+const inject = ["tools", "timer"];
+
+/** Schema of the `notify` tool's parameters (registry-facing JSON Schema). */
+const PARAMETERS = {
+  title: {
+    type: "string",
+    required: true,
+    description: "通知标题，例如「任务完成」或「构建失败」。",
+  },
+  message: {
+    type: "string",
+    required: true,
+    description: "通知正文。发送到机器人渠道时是纯文本；发送邮件时是邮件正文（纯文本）。",
+  },
+  channel: {
+    type: "string",
+    description: "要发送的渠道。不填时使用默认渠道；填 all 则发送到所有已配置的渠道。",
+    enum: ["all", "serverchan", "feishu", "wecom", "dingtalk", "smtp"],
+  },
+  level: {
+    type: "string",
+    description: "可选的通知级别，会在标题前加上对应标签，例如 [完成]、[错误]。",
+    enum: ["info", "success", "warning", "error"],
+  },
+  awaitReply: {
+    type: "boolean",
+    description:
+      "设为 true 时，邮件通知会附带决策编号，你直接回复该邮件即可给 agent 下达下一步指令，" +
+      "回复内容会自动注入回当前会话。仅对邮件渠道生效；要求配置了 imap。",
+  },
+};
+
+/** Schema of the `ask_user_email` tool's parameters. */
+const ASK_PARAMETERS = {
+  question: {
+    type: "string",
+    required: true,
+    description: "要问用户的问题，例如「是否允许我删除这些临时文件？」或「接下来先做哪个任务？」。",
+  },
+  context: {
+    type: "string",
+    description: "可选的背景信息，会附在邮件里帮助用户决策。",
+  },
+  options: {
+    type: "array",
+    description: "可选的建议选项（例如 ['继续', '取消']），用户可以直接回复选项文字。",
+    items: { type: "string" },
+  },
+};
+
+/** Default HTTP timeout for webhook calls, in milliseconds. */
+const HTTP_TIMEOUT_MS = 15000;
+
+/** Fetch with a hard timeout via AbortController (host runtime has fetch). */
+async function fetchWithTimeout(url, options = {}, timeoutMs = HTTP_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`request timed out after ${timeoutMs}ms`)), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Read a JSON error message from a failed webhook response body. */
+async function readErrorBody(response) {
+  try {
+    const text = await response.text();
+    const trimmed = text.trim();
+    if (trimmed.length === 0) return "";
+    try {
+      const parsed = JSON.parse(trimmed);
+      const pick = parsed.msg || parsed.message || parsed.errmsg || parsed.error;
+      return typeof pick === "string" ? pick : trimmed.slice(0, 200);
+    } catch {
+      return trimmed.slice(0, 200);
+    }
+  } catch {
+    return "";
+  }
+}
+
+/** Assert a 2xx response; throw with a channel-specific message otherwise. */
+async function assertOk(response, channelLabel, url) {
+  if (!response.ok) {
+    const detail = await readErrorBody(response);
+    throw new Error(`${channelLabel} failed (HTTP ${response.status}${detail ? `: ${detail}` : ""})`);
+  }
+}
+
+/**
+ * Send a plain-text message to a Feishu custom-bot webhook.
+ * @param webhook - the bot's webhook URL.
+ * @param secret - optional signing secret (used when the bot requires signing).
+ * @param text - the message text.
+ */
+async function sendFeishu(webhook, secret, text) {
+  const body = { msg_type: "text", content: { text } };
+  if (secret) {
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const sign = await hmacSha256Base64(`${timestamp}\n${secret}`, secret);
+    body.timestamp = timestamp;
+    body.sign = sign;
+  }
+  const response = await fetchWithTimeout(webhook, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  await assertOk(response, "Feishu", webhook);
+}
+
+/**
+ * Send a plain-text message to a WeCom (WeChat Work) group-bot webhook.
+ * @param webhook - the bot's webhook URL.
+ * @param text - the message text.
+ */
+async function sendWecom(webhook, text) {
+  const response = await fetchWithTimeout(webhook, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ msgtype: "text", text: { content: text } }),
+  });
+  await assertOk(response, "WeCom", webhook);
+}
+
+/**
+ * Send a plain-text message to a DingTalk custom-bot webhook.
+ * @param webhook - the bot's webhook URL (without query string).
+ * @param secret - optional signing secret (used when the bot requires signing).
+ * @param text - the message text.
+ */
+async function sendDingTalk(webhook, secret, text) {
+  let url = webhook;
+  if (secret) {
+    const timestamp = Date.now();
+    const sign = await hmacSha256Base64(`${timestamp}\n${secret}`, secret);
+    const separator = webhook.includes("?") ? "&" : "?";
+    url = `${webhook}${separator}timestamp=${timestamp}&sign=${encodeURIComponent(sign)}`;
+  }
+  const response = await fetchWithTimeout(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ msgtype: "text", text: { content: text } }),
+  });
+  await assertOk(response, "DingTalk", url);
+}
+
+/**
+ * Send a message via ServerChan (WeChat push).
+ * @param sendKey - the ServerChan Turbo send key.
+ * @param title - the push title.
+ * @param desp - the push body (Markdown).
+ * @param baseUrl - optional API base (defaults to the official endpoint).
+ */
+async function sendServerChan(sendKey, title, desp, baseUrl) {
+  const url = `${baseUrl ?? "https://sctapi.ftqq.com"}/${encodeURIComponent(sendKey)}.send`;
+  const response = await fetchWithTimeout(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ title, desp }),
+  });
+  await assertOk(response, "ServerChan", url);
+}
+
+/** Resolve an SMTP config entry, validating required fields. */
+function resolveSmtp(config, env) {
+  if (!config || typeof config !== "object") return undefined;
+  const expand = (value) => {
+    if (typeof value !== "string") return value;
+    const match = /^\$ENV:([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
+    return match ? env[match[1]] : value;
+  };
+  const host = expand(config.host);
+  const user = expand(config.user);
+  const pass = expand(config.pass);
+  // 区分「没配置」和「配置了但环境变量没解析出来」，给出可操作的错误提示。
+  if (!host) return { error: "smtp 未配置 host（例如 smtp.feishu.cn）" };
+  if (!user) return { error: "smtp 未配置 user（发信账号）" };
+  if (!pass) {
+    const rawPass = config.pass;
+    const envRef = typeof rawPass === "string" && /^\$ENV:([A-Za-z_][A-Za-z0-9_]*)$/.exec(rawPass);
+    return {
+      error: envRef
+        ? `环境变量 ${envRef[1]} 未设置或为空 —— 请先运行: [Environment]::SetEnvironmentVariable("${envRef[1]}", "你的专用密码", "User") 并重启 DSH`
+        : "smtp 未配置 pass（专用密码/授权码）",
+    };
+  }
+  const from = expand(config.from) ?? user;
+  const fromName = expand(config.fromName);
+  return {
+    host,
+    port: config.port ?? (config.secure === false ? 587 : 465),
+    secure: config.secure ?? true,
+    user,
+    pass,
+    from,
+    fromName,
+    fromHeader: fromName ? `${fromName} <${from}>` : from,
+    to: (Array.isArray(config.to) ? config.to : [config.to]).map(expand).filter(Boolean),
+    ...config.rejectUnauthorized !== undefined ? { rejectUnauthorized: config.rejectUnauthorized } : {},
+    ...config.retries !== undefined ? { retries: config.retries } : {},
+  };
+}
+
+/** Expand a `$ENV:NAME` reference against the given environment. */
+function expandEnv(value, env) {
+  if (typeof value !== "string") return value;
+  const match = /^\$ENV:([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
+  return match ? env[match[1]] : value;
+}
+
+/**
+ * Resolve one channel entry from plugin config, or undefined when not
+ * configured. `serverchan` requires `sendKey`; webhook channels require
+ * `webhook`; `smtp` requires host/user/pass.
+ */
+function resolveChannel(config, channelName, env) {
+  if (!config || typeof config !== "object") return undefined;
+  const entry = config[channelName];
+  if (!entry || typeof entry !== "object") return undefined;
+  if (channelName === "smtp") {
+    return resolveSmtp(entry, env);
+  }
+  if (channelName === "serverchan") {
+    const sendKey = expandEnv(entry.sendKey, env);
+    return sendKey ? { sendKey, baseUrl: expandEnv(entry.baseUrl, env) } : undefined;
+  }
+  const webhook = expandEnv(entry.webhook, env);
+  if (!webhook) return undefined;
+  return { webhook, secret: expandEnv(entry.secret, env) };
+}
+
+/** Whether a resolved channel entry is a config-error placeholder. */
+function isConfigError(entry) {
+  return entry !== undefined && entry !== null && typeof entry === "object" && typeof entry.error === "string";
+}
+
+/** HMAC-SHA256 → base64 (shared by Feishu and DingTalk signing). */
+function hmacSha256Base64(data, secret) {
+  return Promise.resolve().then(() => createHmac("sha256", secret).update(data).digest("base64"));
+}
+
+/**
+ * Build the level tag prefix and the final titled text.
+ */
+function formatTitle(title, level) {
+  const tag = { info: "[信息]", success: "[完成]", warning: "[警告]", error: "[错误]" }[level];
+  return tag ? `${tag} ${title}` : title;
+}
+
+/**
+ * Run one send attempt; resolves the outcome, never throws.
+ * @param reply - optional { id, hint } — when set, the SMTP subject carries
+ *   the decision tag and the body gains a "reply to command" hint.
+ */
+async function trySend(channel, config, title, message, env, reply) {
+  const entry = resolveChannel(config, channel, env);
+  try {
+    switch (channel) {
+      case "serverchan": {
+        if (!entry) throw new Error("Server酱渠道未配置（缺少 sendKey）");
+        await sendServerChan(entry.sendKey, title, message, entry.baseUrl);
+        return { channel, ok: true, detail: "sent" };
+      }
+      case "feishu": {
+        if (!entry) throw new Error("飞书渠道未配置（缺少 webhook）");
+        await sendFeishu(entry.webhook, entry.secret, message);
+        return { channel, ok: true, detail: "sent" };
+      }
+      case "wecom": {
+        if (!entry) throw new Error("企业微信渠道未配置（缺少 webhook）");
+        await sendWecom(entry.webhook, message);
+        return { channel, ok: true, detail: "sent" };
+      }
+      case "dingtalk": {
+        if (!entry) throw new Error("钉钉渠道未配置（缺少 webhook）");
+        await sendDingTalk(entry.webhook, entry.secret, message);
+        return { channel, ok: true, detail: "sent" };
+      }
+      case "smtp": {
+        if (!entry) throw new Error("邮件渠道未配置");
+        if (isConfigError(entry)) throw new Error(entry.error);
+        const finalTitle = reply ? `${decisionTag(reply.id)} ${title}` : title;
+        const finalMessage = reply
+          ? `${message}\n\n---\n回复此邮件可直接给 agent 下达下一步指令（决策编号 ${reply.id}）。回复内容会作为你的指令自动回到会话中。`
+          : message;
+        await sendEmail(entry, finalTitle, finalMessage);
+        return { channel, ok: true, detail: `sent to ${entry.to.join(", ")}` };
+      }
+      default:
+        throw new Error(`未知渠道 ${JSON.stringify(channel)}`);
+    }
+  } catch (error) {
+    return { channel, ok: false, detail: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/** Build the list of channels to send to for this call. */
+function targetChannels(channelArg, config, env) {
+  const configured = [];
+  for (const candidate of ["serverchan", "feishu", "wecom", "dingtalk", "smtp"]) {
+    if (resolveChannel(config, candidate, env) !== undefined) configured.push(candidate);
+  }
+  if (channelArg === "all") return configured;
+  if (channelArg !== undefined) {
+    if (!["serverchan", "feishu", "wecom", "dingtalk", "smtp"].includes(channelArg)) {
+      throw new Error(`无效的渠道 ${JSON.stringify(channelArg)}（可选：all/serverchan/feishu/wecom/dingtalk/smtp）`);
+    }
+    return configured.includes(channelArg) ? [channelArg] : [];
+  }
+  // Default: the configured default channel, else every configured channel.
+  const defaultChannel = config?.defaultChannel;
+  if (typeof defaultChannel === "string" && defaultChannel !== "all" && configured.includes(defaultChannel)) {
+    return [defaultChannel];
+  }
+  return configured;
+}
+
+/** Plugin config schema. Optional object fields: all fields are optional by default. */
+const Config = z.object({
+  defaultChannel: z.string().default(""),
+  serverchan: z.object({ sendKey: z.string(), baseUrl: z.string() }),
+  feishu: z.object({ webhook: z.string(), secret: z.string() }),
+  wecom: z.object({ webhook: z.string() }),
+  dingtalk: z.object({ webhook: z.string(), secret: z.string() }),
+  smtp: z.object({
+    host: z.string(),
+    port: z.number(),
+    secure: z.boolean(),
+    rejectUnauthorized: z.boolean(),
+    user: z.string(),
+    pass: z.string(),
+    from: z.string(),
+    fromName: z.string(),
+    to: z.union([z.string(), z.array(z.string())]),
+  }),
+  // 收件配置：用于「ask_user_email」轮询用户对邮件的回复。
+  imap: z.object({
+    host: z.string(),
+    port: z.number(),
+    secure: z.boolean(),
+    user: z.string(),
+    pass: z.string(),
+    mailbox: z.string(),
+    rejectUnauthorized: z.boolean(),
+  }),
+  pollIntervalMs: z.number(),
+});
+
+/** Resolve the IMAP config (same $ENV: expansion as SMTP). */
+function resolveImap(config, env) {
+  if (!config?.imap) return undefined;
+  const expand = (value) => {
+    if (typeof value !== "string") return value;
+    const match = /^\$ENV:([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
+    return match ? env[match[1]] : value;
+  };
+  const imap = config.imap;
+  const host = expand(imap.host);
+  const user = expand(imap.user);
+  const pass = expand(imap.pass);
+  if (!host || !user || !pass) return undefined;
+  return {
+    host,
+    port: imap.port ?? 993,
+    secure: imap.secure ?? true,
+    user,
+    pass,
+    mailbox: imap.mailbox ?? "INBOX",
+    rejectUnauthorized: imap.rejectUnauthorized ?? true,
+  };
+}
+
+function apply(ctx, config) {
+  const resolved = config ?? {};
+  const env = process.env;
+  const imapConfig = resolveImap(resolved, env);
+  const pollIntervalMs = resolved.pollIntervalMs ?? 60000;
+
+  // 邮件回复轮询：有 imap 配置且有 pending 决策时才真正连接（间隔轮询）。
+  // timer 已通过 inject 声明（host 层 dsh-base 提供），这里直接可用。
+  if (imapConfig) {
+    ctx.interval(async () => {
+      try {
+        await pollAndInject(imapConfig);
+      } catch (error) {
+        console.error("[dsh-whale-notify] imap poll failed:", error instanceof Error ? error.message : String(error));
+      }
+    }, pollIntervalMs);
+  }
+  ctx.tools.register(defineTool({
+    name: "notify",
+    description:
+      "向用户发送一条通知消息（支持微信 Server酱、飞书、企业微信、钉钉、邮件）。" +
+      "当耗时任务完成、失败，或需要用户离开聊天也能注意到时使用。" +
+      "传入标题和正文；可选指定 channel（渠道）或 'all'（全部渠道）。" +
+      "未配置的渠道会被跳过。",
+    parameters: PARAMETERS,
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          delivered: {
+            type: "array",
+            required: true,
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                channel: { type: "string", required: true },
+                ok: { type: "boolean", required: true },
+                detail: { type: "string", required: true },
+              },
+            },
+          },
+        },
+      },
+      render: (_args, value) => [{
+        type: "text",
+        text: value.delivered.map((d) => `${d.channel}: ${d.ok ? "OK" : "FAILED — " + d.detail}`).join("\n"),
+      }],
+    },
+    async execute(args, exec) {
+      const title = formatTitle(args.title, args.level);
+      const channels = targetChannels(args.channel, resolved, process.env);
+      if (channels.length === 0) {
+        throw new Error("notify：尚未配置任何通知渠道 —— 请在 tool-notify 插件配置中添加 webhook 或 SMTP 信息");
+      }
+      // awaitReply=true：让邮件通知可回复指挥（要求已配置 imap 收信）。
+      let reply = undefined;
+      if (args.awaitReply === true) {
+        if (!imapConfig) {
+          throw new Error("notify(awaitReply:true)：需要先配置 imap（收信）才能接收你的邮件回复 —— 请在 tool-notify 插件配置中添加 imap 段");
+        }
+        const smtp = resolveChannel(resolved, "smtp", env);
+        if (!smtp || isConfigError(smtp)) {
+          throw new Error("notify(awaitReply:true)：需要先配置 smtp（发信）才能发送可回复的通知邮件");
+        }
+        reply = {
+          id: registerPending(exec.agent, title, smtp.to, undefined, "command"),
+        };
+      }
+      const delivered = [];
+      for (const channel of channels) {
+        delivered.push(await trySend(channel, resolved, title, args.message, process.env, reply));
+      }
+      const failed = delivered.filter((d) => !d.ok);
+      // 发送日志：追加 JSONL 到 $DSH_HOME/logs/notify.log（失败静默降级，不影响通知）。
+      try {
+        await appendLog({
+          ts: new Date().toISOString(),
+          title,
+          channels: delivered,
+          allOk: failed.length === 0,
+          ...reply ? { decisionId: reply.id } : {},
+        });
+      } catch {
+        // 日志失败不影响发送结果。
+      }
+      if (failed.length === delivered.length) {
+        throw new Error(`notify：所有渠道都发送失败 —— ${failed.map((d) => `${d.channel}（${d.detail}）`).join("；")}`);
+      }
+      return { delivered };
+    },
+    presentCall: (args) => ({
+      card: "generic",
+      title: "Notify user",
+      kind: "other",
+      rawInput: args.title,
+    }),
+  }));
+
+  // ── ask_user_email：发邮件询问用户，并轮询回复后唤醒 agent ──
+  ctx.tools.register(defineTool({
+    name: "ask_user_email",
+    description:
+      "通过电子邮件向用户提问并等待回复。适合需要用户决策/审批、但用户不在电脑前时使用：" +
+      "邮件发出后本工具立即返回，插件会后台轮询收件箱；用户回复邮件后，回复内容会作为一条" +
+      "用户消息注入回当前会话，agent 据此继续。要求配置了 smtp（发）和 imap（收）。",
+    parameters: ASK_PARAMETERS,
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          decisionId: { type: "string", required: true },
+          sentTo: { type: "string", required: true },
+          note: { type: "string", required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: "text",
+        text: `已通过邮件询问用户（${value.sentTo}）。决策编号 ${value.decisionId}。${value.note}`,
+      }],
+    },
+    async execute(args, exec) {
+      const smtp = resolveChannel(resolved, "smtp", env);
+      if (!smtp || isConfigError(smtp)) {
+        throw new Error("ask_user_email：需要先配置 smtp（发信）才能发送询问邮件");
+      }
+      if (!imapConfig) {
+        throw new Error("ask_user_email：需要先配置 imap（收信）才能接收用户的邮件回复 —— 请在 tool-notify 插件配置中添加 imap 段");
+      }
+      const recipients = smtp.to.length > 0 ? smtp.to : ["no-reply@localhost"];
+      const id = registerPending(exec.agent, args.question, recipients);
+
+      const optionsText = Array.isArray(args.options) && args.options.length > 0
+        ? `\n\n可选项：${args.options.map((o) => `「${o}」`).join("、")}（直接回复其中一个即可）`
+        : "";
+      const contextText = args.context ? `\n\n背景：${args.context}` : "";
+      const body =
+        `你好，agent 需要你做一个决定：\n\n${args.question}${optionsText}${contextText}\n\n` +
+        `请直接回复这封邮件告知你的选择（例如：继续 / 取消 / 具体指示）。回复会自动回到会话中。`;
+
+      const title = `${decisionTag(id)} 需要你的决定：${args.question.slice(0, 40)}`;
+      await sendEmail(smtp, title, body);
+      await appendLog({
+        ts: new Date().toISOString(),
+        kind: "ask_user_email",
+        decisionId: id,
+        question: args.question,
+        sentTo: recipients,
+      }).catch(() => {});
+
+      return {
+        decisionId: id,
+        sentTo: recipients.join(", "),
+        note: "用户回复后会自动回到本会话，请等待（不要重复询问）。",
+      };
+    },
+    presentCall: (args) => ({
+      card: "generic",
+      title: "Ask user by email",
+      kind: "other",
+      rawInput: args.question,
+    }),
+  }));
+}
+
+export { Config, apply, inject, name };
