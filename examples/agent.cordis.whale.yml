@@ -53,6 +53,16 @@
     #   webhook: '$ENV:FEISHU_WEBHOOK'
     #   secret: '$ENV:FEISHU_SECRET'        # 可选加签密钥
 
+    # ── 飞书开放平台（自建应用）：双向聊天 ──
+    # 后台：事件与回调→订阅方式选「使用长连接接收事件」；订阅 im.message.receive_v1；
+    #       开通 im:message 权限；发布新版本。receiveId 为私聊 chat_id。
+    # feishuBot:
+    #   appId: '$ENV:FEISHU_APP_ID'
+    #   appSecret: '$ENV:FEISHU_APP_SECRET'
+    #   receiveId: 'oc_xxxxxxxxxxxxxxxx'
+    #   receiveIdType: 'chat_id'
+    #   targetSession: ''
+
     # ── 企业微信群机器人 ──
     # wecom:
     #   webhook: '$ENV:WECOM_WEBHOOK'

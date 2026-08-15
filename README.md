@@ -1,15 +1,16 @@
-# 🐋 Whale Notify（鲸鱼通知）—— DeepSeek Harness 通知与邮件问答插件
+# 🐋 Whale Notify（鲸鱼通知）—— DeepSeek Harness 通知、邮件问答与飞书机器人插件
 
-给 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 的 agent 注入鲸鱼娘的灵魂：一个 **鲸鱼娘人设**，和一个**能发通知、能收回复、能听你指挥**的邮件插件。
+给 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 的 agent 注入鲸鱼娘的灵魂：一个 **鲸鱼娘人设**，和一个**能发通知、能收回复、能听你指挥**的插件——支持**飞书开放平台双向聊天**、邮件问答、多渠道通知。
 
 > 人设灵感来自 [萌娘百科·DeepSeek娘](https://zh.moegirl.org.cn/DeepSeek%E5%A8%98)（白发蓝瞳、鲸鱼尾巴、傲娇天才）。
 
 ## ✨ 功能一览
 
-| 插件 | 工具 | 能力 |
+| 插件 | 工具/能力 | 说明 |
 | --- | --- | --- |
-| **dsh-whale-notify**（鲸鱼通知） | `notify` | 任务完成/失败通知 → 微信（Server酱）、飞书、企业微信、钉钉、邮箱（5 渠道） |
-| | `notify(awaitReply:true)` | 通知邮件**可回复指挥**：回复邮件即可给 agent 下达下一步指令 |
+| **dsh-whale-notify**（鲸鱼通知） | `notify` | 任务完成/失败通知 → 飞书开放平台、微信（Server酱）、飞书 webhook、企业微信、钉钉、邮箱 |
+| | **飞书双向聊天** | 你在飞书里给机器人发消息 → 注入 DSH 会话 → agent 执行；任务结果可推回飞书 |
+| | `notify(awaitReply:true)` | 邮件通知**可回复指挥**：回复邮件即可给 agent 下达下一步指令 |
 | | `ask_user_email` | agent 通过邮件提问/审批，你回复后答案**自动注入会话** |
 | **鲸鱼娘 persona** | — | 傲娇天才 AI 人设（附完整工作准则，先干活再卖萌） |
 
@@ -24,7 +25,8 @@ whale-notify/
 │   └── dsh-whale-notify/              # 鲸鱼通知插件（包名 dsh-whale-notify）
 │       ├── package.json
 │       └── lib/
-│           ├── index.js               # 插件主体：notify / ask_user_email
+│           ├── index.js               # 插件主体：notify / ask_user_email + 飞书注入
+│           ├── feishu.js              # 飞书开放平台：token/发消息/长连接接收（官方 SDK）
 │           ├── smtp.js                # 手写 SMTP 客户端（零依赖）
 │           ├── imap.js                # IMAP 轮询 + 邮件解析
 │           └── ask.js                 # 决策状态管理 + 回复注入
@@ -50,10 +52,12 @@ $DSH_HOME\profiles\node_modules\
 }
 ```
 
-> ⚠️ `ask_user_email` 需要 IMAP 客户端库 `imapflow`。将它安装到同一 node_modules 目录：
+> ⚠️ **运行时依赖**（安装到同一 node_modules 目录）：
 > ```sh
-> cd <profile 目录> && npm install imapflow
+> cd <profile 目录> && npm install imapflow @larksuiteoapi/node-sdk
 > ```
+> - `imapflow` — `ask_user_email` 收信需要（IMAP）
+> - `@larksuiteoapi/node-sdk` — 飞书开放平台长连接接收需要
 
 ### 2. 配置 preset
 
@@ -88,6 +92,38 @@ $DSH_HOME\profiles\node_modules\
 
 > ⚠️ 各邮箱的授权码互不通用：飞书用「专用密码」、QQ 用「授权码」、163 用「客户端授权码」、
 > Gmail 用「应用专用密码」。每个邮箱单独开启 SMTP/IMAP 服务后各拿各的码。
+
+#### 💬 飞书开放平台（自建应用）—— 双向聊天，可收发
+
+**能力**：你在飞书里给机器人发消息 → 注入 DSH 会话 → agent 执行；`notify` 也能推消息回飞书。
+
+**飞书后台准备**（[open.feishu.cn/app](https://open.feishu.cn/app)）：
+1. 创建**自建应用**，记下 App ID / App Secret
+2. **事件与回调** → 订阅方式选 **「使用长连接接收事件/回调」**
+3. **事件**：添加 **`im.message.receive_v1`**（接收消息）
+4. **权限管理**：开通 **`im:message`**（获取与发送单聊、群组消息）等
+5. **版本管理与发布**：创建版本并**发布**（自建应用改配置必须发布才生效）
+
+**配置**：
+
+```yaml
+    feishuBot:
+      appId: '$ENV:FEISHU_APP_ID'          # 环境变量引用，勿写明文
+      appSecret: '$ENV:FEISHU_APP_SECRET'
+      receiveId: 'oc_xxxxxxxxxxxxxxxx'      # 目标会话 chat_id / open_id（私聊给机器人发条消息即可在日志/事件中看到）
+      receiveIdType: 'chat_id'             # chat_id / open_id / user_id
+      targetSession: ''                    # 可选：飞书消息注入哪个 DSH 会话（sessionId）；留空=最近活跃会话
+```
+
+**环境变量**：
+
+```powershell
+[Environment]::SetEnvironmentVariable("FEISHU_APP_ID", "cli_xxxxxxxxxxxx", "User")
+[Environment]::SetEnvironmentVariable("FEISHU_APP_SECRET", "你的AppSecret", "User")
+```
+
+> 💡 长连接由官方 `@larksuiteoapi/node-sdk` 处理（token 刷新、protobuf 解码、自动重连）。
+> 自建应用的 App Secret 是敏感凭证，泄露后请到后台重置。
 
 #### 💬 飞书群机器人（webhook）—— 只发通知，最简接入
 
@@ -130,6 +166,7 @@ $DSH_HOME\profiles\node_modules\
 >
 > | 渠道 | 发通知 | 回复指挥 | 说明 |
 > | --- | --- | --- | --- |
+> | **飞书开放平台**（自建应用） | ✅ | ✅（飞书里直接回复） | 双向聊天，实时注入会话 |
 > | 邮箱 SMTP/IMAP | ✅ | ✅（回复邮件） | 全功能 |
 > | 飞书 webhook | ✅ | ❌（单向） | 最简单，只发不收 |
 > | 微信 Server酱 | ✅ | ❌（单向） | |
@@ -142,6 +179,9 @@ $DSH_HOME\profiles\node_modules\
 ```powershell
 # 邮箱授权码（发/收信共用）
 [Environment]::SetEnvironmentVariable("MAIL_PASS", "你的专用密码", "User")
+# 飞书开放平台 App ID / App Secret（自建应用）
+[Environment]::SetEnvironmentVariable("FEISHU_APP_ID", "cli_xxxxxxxxxxxx", "User")
+[Environment]::SetEnvironmentVariable("FEISHU_APP_SECRET", "你的AppSecret", "User")
 # 飞书机器人签名密钥（如果创建时加了签）
 [Environment]::SetEnvironmentVariable("FEISHU_BOT_SECRET", "你的密钥", "User")
 # 微信 SendKey
@@ -149,6 +189,17 @@ $DSH_HOME\profiles\node_modules\
 ```
 
 重启 DSH 后生效。**密钥永远不会写进任何配置文件**。
+
+## 💬 飞书双向聊天（核心玩法）
+
+你在飞书里给「鲸鱼娘」机器人发消息 → 长连接实时收到 → 注入 DSH 会话 →
+agent 把消息当作你的指令执行 → 结果可通过 `notify(channel: "feishu_bot")` 推回飞书。
+
+```text
+你（飞书）──消息──▶ 鲸鱼娘机器人 ──长连接──▶ DSH 会话（agent 执行）
+                                              │
+你 ◀──通知/结果──── notify(feishu_bot) ◀──────┘
+```
 
 ## 📧 邮件回复指挥 & 问答（核心玩法）
 ### 通知可回复指挥
