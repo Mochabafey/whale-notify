@@ -12,6 +12,7 @@ import {
   readFriendConfig, writeFriendConfig, readFriendPrompts, appendFriendMemory,
   readFriendMemory, isBlacklisted, buildFriendPrompt, friendModeDir,
 } from "./friendmode.js";
+import { saveMemoryDoc, searchMemoryDocs, readMemoryDoc, memoryDir, migrateLegacyFriendMemory } from "./memory.js";
 
 /** Append one JSONL record to $DSH_HOME/logs/notify.log (creates dir/file). */
 async function appendLog(record) {
@@ -512,6 +513,11 @@ function apply(ctx, config) {
   const feishuBotConfig = resolveChannel(resolved, "feishu_bot", env);
   const qqConfig = resolveChannel(resolved, "qq", env);
 
+  // 迁移旧的群友记忆（friendmode/memory.jsonl → memory/friend/）
+  migrateLegacyFriendMemory().then((n) => {
+    if (n > 0) console.log(`[dsh-whale-notify] 已迁移 ${n} 个群友记忆文件到统一记忆库`);
+  }).catch(() => {});
+
   // ── 访问控制（黑白名单）──
   // accessControl: { mode: "whitelist"|"open", allowedUsers: { feishu:[], qq:[] }, readOnlyUsers: { feishu:[], qq:[] } }
   // whitelist 模式：仅 allowedUsers 可注入指令；readOnlyUsers 可注入但标记只读；
@@ -867,6 +873,24 @@ function apply(ctx, config) {
       },
       async execute(args, exec) {
         if (!exec.agent) throw new Error("recall_memory 需要 agent 会话上下文");
+        // ① 先搜统一记忆库（总结文档，快且准）
+        const docs = await searchMemoryDocs(args.query, 5);
+        if (docs.length > 0) {
+          const doc = docs[0];
+          const content = await readMemoryDoc(doc.path);
+          if (exec.agent.followup) {
+            exec.agent.followup({
+              id: randomUUID(),
+              role: "user",
+              content: [{
+                type: "text",
+                text: `## 从记忆库恢复的记忆（${doc.title}）\n\n${content}\n\n（此记忆来自统一记忆库 ${doc.category}，作为背景参考。）`,
+              }],
+              source: { kind: "user" },
+            });
+            return { injected: true, detail: `已从记忆库恢复「${doc.title}」（${doc.category}）。` };
+          }
+        }
         const currentId = exec.agent.id;
         let chosenSession;
         if (args.sessionId) {
@@ -1300,6 +1324,60 @@ function apply(ctx, config) {
       title: "Recall skill",
       kind: "other",
       rawInput: args.query,
+    }),
+  }));
+
+  // ── save_memory：保存当前会话为记忆文档（统一记忆库）──
+  // 用户说「保存记忆/记住这个」或会话结束总结时，压缩当前内容存为 markdown。
+  ctx.tools.register(defineTool({
+    name: "save_memory",
+    description:
+      "把当前对话/任务总结保存到统一记忆库。用户说「保存记忆」「记住这个」「总结一下存起来」时使用。" +
+      "先概括本次会话的要点（结论/步骤/偏好），再调用本工具存为文档，下次可用 recall_memory 搜到。" +
+      "类别 conversations=跨会话记忆（默认）；summaries=手动总结。",
+    parameters: {
+      title: {
+        type: "string",
+        required: true,
+        description: "记忆标题，如「股市复盘-2026-08-14」「项目的部署步骤」。",
+      },
+      content: {
+        type: "string",
+        required: true,
+        description: "总结内容（markdown）：结论、关键步骤、用户偏好等，压缩成要点而非原文。",
+      },
+      category: {
+        type: "string",
+        description: "conversations（跨会话记忆，默认）或 summaries（手动总结）。",
+        enum: ["conversations", "summaries"],
+      },
+      tags: {
+        type: "array",
+        description: "可选标签便于搜索，如 ['股市', '复盘']。",
+        items: { type: "string" },
+      },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          saved: { type: "boolean", required: true },
+          path: { type: "string", required: true },
+        },
+      },
+      render: (_args, value) => [{ type: "text", text: value.saved ? `✅ 已存入记忆库：${value.path}` : "保存失败" }],
+    },
+    async execute(args) {
+      const path = await saveMemoryDoc(args.category ?? "conversations", args.title, args.content, args.tags ?? []);
+      await appendLog({ ts: new Date().toISOString(), kind: "save_memory", title: args.title, path }).catch(() => {});
+      return { saved: true, path };
+    },
+    presentCall: (args) => ({
+      card: "generic",
+      title: "Save memory",
+      kind: "other",
+      rawInput: args.title,
     }),
   }));
 

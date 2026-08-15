@@ -76,29 +76,16 @@ export async function readFriendPrompts() {
   }
 }
 
-/** Append one line to the independent chat memory. */
+/** Append one line to the chat memory (stored under memory/friend/). */
 export async function appendFriendMemory(entry) {
-  const dir = friendModeDir();
-  await mkdir(dir, { recursive: true });
-  await writeFile(
-    join(dir, "memory.jsonl"),
-    `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`,
-    { encoding: "utf8", flag: "a" },
-  );
+  const { appendFriendMemory: append } = await import("./memory.js");
+  return append(entry);
 }
 
-/** Read recent chat memory (last N lines). */
+/** Read recent chat memory (stored under memory/friend/). */
 export async function readFriendMemory(limit = 30) {
-  const dir = friendModeDir();
-  try {
-    const text = await readFile(join(dir, "memory.jsonl"), "utf8");
-    const lines = text.trim().split("\n").filter(Boolean).slice(-limit);
-    return lines.map((l) => {
-      try { return JSON.parse(l); } catch { return null; }
-    }).filter(Boolean);
-  } catch {
-    return [];
-  }
+  const { readFriendMemory: read } = await import("./memory.js");
+  return read(limit);
 }
 
 /** Check whether a group/user is blacklisted. */
