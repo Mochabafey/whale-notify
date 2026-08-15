@@ -2,8 +2,7 @@
 #  鲸鱼娘 preset 配置示例（脱敏版）
 #
 #  把本文件的内容合并进你的 agent preset 的 agent.cordis.yml（或在 profile
-#  的 cordis.patch.yml 里插入），即可启用鲸鱼通知（notify / ask_user_email）
-#  和单位换算（unit_convert）。
+#  的 cordis.patch.yml 里插入），即可启用鲸鱼通知（notify / ask_user_email）。
 #
 #  ⚠️ 安全提醒：
 #  - 所有密钥一律用 $ENV:变量名 引用（见下方），不要把真实密码写进本文件
@@ -36,10 +35,6 @@
       - 卖萌是调味品，不是主菜。用户让你干活时，先干活，再卖萌。
       - 任务完成时可以用 notify 工具通知用户；需要用户决策时用 ask_user_email。
       - 用中文回复，代码和术语保留原文。
-
-# ── 单位换算 ──────────────────────────────────────────────────────────────
-- id: tool-unit-convert
-  name: 'dsh-tool-unit-convert'
 
 # ── 鲸鱼通知：notify / ask_user_email ─────────────────────────────────────
 - id: tool-notify

@@ -1,6 +1,6 @@
-# 🐋 Whale Notify（鲸鱼通知）—— DeepSeek Harness 插件集
+# 🐋 Whale Notify（鲸鱼通知）—— DeepSeek Harness 通知与邮件问答插件
 
-给 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 的 agent 注入鲸鱼娘的灵魂：一个 **鲸鱼娘人设**、一个 **单位换算工具**，和一个**能发通知、能收回复、能听你指挥**的邮件插件。
+给 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 的 agent 注入鲸鱼娘的灵魂：一个 **鲸鱼娘人设**，和一个**能发通知、能收回复、能听你指挥**的邮件插件。
 
 > 人设灵感来自 [萌娘百科·DeepSeek娘](https://zh.moegirl.org.cn/DeepSeek%E5%A8%98)（白发蓝瞳、鲸鱼尾巴、傲娇天才）。
 
@@ -11,7 +11,6 @@
 | **dsh-whale-notify**（鲸鱼通知） | `notify` | 任务完成/失败通知 → 微信（Server酱）、飞书、企业微信、钉钉、邮箱（5 渠道） |
 | | `notify(awaitReply:true)` | 通知邮件**可回复指挥**：回复邮件即可给 agent 下达下一步指令 |
 | | `ask_user_email` | agent 通过邮件提问/审批，你回复后答案**自动注入会话** |
-| **dsh-tool-unit-convert**（单位换算） | `unit_convert` | 长度/质量/温度/数据量/时间/速度六类单位换算 |
 | **鲸鱼娘 persona** | — | 傲娇天才 AI 人设（附完整工作准则，先干活再卖萌） |
 
 ## 📦 目录结构
@@ -22,16 +21,13 @@ whale-notify/
 ├── examples/
 │   └── agent.cordis.whale.yml         # 脱敏的 preset 配置示例（可直接参考）
 ├── plugins/
-│   ├── dsh-whale-notify/              # 鲸鱼通知插件（包名 dsh-whale-notify）
-│   │   ├── package.json
-│   │   └── lib/
-│   │       ├── index.js               # 插件主体：notify / ask_user_email
-│   │       ├── smtp.js                # 手写 SMTP 客户端（零依赖）
-│   │       ├── imap.js                # IMAP 轮询 + 邮件解析
-│   │       └── ask.js                 # 决策状态管理 + 回复注入
-│   └── dsh-tool-unit-convert/         # 单位换算插件
+│   └── dsh-whale-notify/              # 鲸鱼通知插件（包名 dsh-whale-notify）
 │       ├── package.json
-│       └── lib/index.js
+│       └── lib/
+│           ├── index.js               # 插件主体：notify / ask_user_email
+│           ├── smtp.js                # 手写 SMTP 客户端（零依赖）
+│           ├── imap.js                # IMAP 轮询 + 邮件解析
+│           └── ask.js                 # 决策状态管理 + 回复注入
 └── verify-notify.mjs                  # 通知插件自测脚本（可选）
 ```
 
@@ -39,20 +35,18 @@ whale-notify/
 
 ### 1. 放置插件
 
-把 `plugins/` 下的两个插件文件夹复制到 DSH profile 的 node_modules：
+把 `plugins/dsh-whale-notify` 文件夹复制到 DSH profile 的 node_modules：
 
 ```text
 $DSH_HOME\profiles\node_modules\
-├── dsh-whale-notify\
-└── dsh-tool-unit-convert\
+└── dsh-whale-notify\
 ```
 
 并在 `$DSH_HOME\profiles\web\package.json` 的 `dependencies` 里登记（可选，便于 pnpm 管理）：
 
 ```json
 "dependencies": {
-  "dsh-whale-notify": "file:<你的路径>/whale-notify/plugins/dsh-whale-notify",
-  "dsh-tool-unit-convert": "file:<你的路径>/whale-notify/plugins/dsh-tool-unit-convert"
+  "dsh-whale-notify": "file:<你的路径>/whale-notify/plugins/dsh-whale-notify"
 }
 ```
 
