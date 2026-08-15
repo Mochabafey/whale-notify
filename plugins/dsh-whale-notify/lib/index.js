@@ -1005,7 +1005,201 @@ function apply(ctx, config) {
     }));
   }
 
-  // ── learn_skill / recall_skill：学习与调取技能（知识库）──
+  // ── settings：对话内查看/修改配置（统一总控）──
+  // agent 在对话中提到「配置/功能/设置」时用本工具：get 列出模块清单与选项，
+  // set 按路径改 preset 配置（支持数组追加）。改动需重启 DSH 生效。
+  const resolvePresetPath = async () => {
+    const pid = presetId;
+    if (!pid || !agentPresets?.resolve) return undefined;
+    try {
+      return await agentPresets.resolve(pid);
+    } catch {
+      return undefined;
+    }
+  };
+
+  // 功能模块清单：每个模块的说明 + 可配置项（供 get 展示，agent 据此引导）
+  const MODULES = [
+    { key: "notify", name: "📢 通知", desc: "任务完成/状态通知（飞书/QQ/邮件/微信/钉钉/企微）", options: [{ path: "defaultChannel", label: "默认渠道", type: "string" }] },
+    { key: "report", name: "📅 定时汇报", desc: "每日定点/定期推送（默认关闭）", options: [
+      { path: "enableReports", label: "开关", type: "bool", value: () => resolved.enableReports === true },
+    ] },
+    { key: "friend", name: "👥 群友模式", desc: "QQ 群里像网友互动（黑名单/称呼/触发）", options: [
+      { path: "friend.enabled", label: "开关", type: "bool", value: () => false },
+      { path: "friend.nickname", label: "称呼", type: "string" },
+      { path: "friend.blacklist.groups", label: "屏蔽群", type: "array" },
+      { path: "friend.blacklist.users", label: "屏蔽用户", type: "array" },
+    ] },
+    { key: "acl", name: "🔐 访问控制", desc: "谁可指挥（白名单/开放）", options: [
+      { path: "accessControl.mode", label: "模式", type: "enum", values: ["whitelist", "open"] },
+      { path: "accessControl.allowedUsers.qq", label: "白名单QQ", type: "array" },
+      { path: "accessControl.allowedUsers.feishu", label: "白名单飞书", type: "array" },
+    ] },
+    { key: "memory", name: "🧠 记忆模式", desc: "新会话恢复历史记忆", options: [] },
+    { key: "learn", name: "🎓 学习模式", desc: "技能知识库（learn_skill/recall_skill）", options: [] },
+  ];
+
+  // 读配置：按路径取值（支持 a.b.c）
+  const getByPath = (obj, path) => {
+    return path.split(".").reduce((o, k) => (o === undefined ? undefined : o[k]), obj);
+  };
+
+  ctx.tools.register(defineTool({
+    name: "settings",
+    description:
+      "查看和修改插件配置。对话中提到「配置/功能/设置」时使用。" +
+      "get 列出功能模块清单和配置选项；set <路径> <值> 修改配置（数组可用 + 追加，如 friend.blacklist.groups+=[123]）。" +
+      "修改后需要重启 DSH 生效。",
+    parameters: {
+      action: {
+        type: "string",
+        required: true,
+        enum: ["get", "set"],
+        description: "get=查看配置（不带 path 列出全部模块）；set=修改配置。",
+      },
+      path: {
+        type: "string",
+        description: "配置路径（点分），如 enableReports、friend.nickname、accessControl.mode、friend.blacklist.groups。",
+      },
+      value: {
+        type: "string",
+        description: "set 时的值。数组追加用 +=[...] 语法，如 friend.blacklist.groups+=[\"123\"]。",
+      },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          ok: { type: "boolean", required: true },
+          detail: { type: "string", required: true },
+        },
+      },
+      render: (_args, value) => [{ type: "text", text: value.detail }],
+    },
+    async execute(args) {
+      // get：列出模块清单 + 当前配置
+      if (args.action === "get") {
+        const path = args.path;
+        if (!path) {
+          const lines = ["📋 鲸鱼娘插件配置总览：\n"];
+          for (const mod of MODULES) {
+            lines.push(`${mod.name} ${mod.desc}`);
+            for (const opt of mod.options) {
+              let val;
+              if (opt.value) val = opt.value();
+              else val = getByPath(resolved, opt.path);
+              lines.push(`  · ${opt.label} (${opt.path}): ${JSON.stringify(val ?? "未设置")}`);
+            }
+          }
+          lines.push("\n💡 修改示例：settings set enableReports true / settings set friend.blacklist.groups+=[\"123\"]");
+          return { ok: true, detail: lines.join("\n") };
+        }
+        const val = path.startsWith("friend.") ? await (async () => {
+          const fm = await readFriendConfig();
+          return getByPath(fm, path.slice("friend.".length));
+        })() : getByPath(resolved, path);
+        return { ok: true, detail: `${path} = ${JSON.stringify(val ?? "未设置")}` };
+      }
+
+      // set：按路径写配置
+      if (args.action === "set") {
+        if (!args.path || args.value === undefined) {
+          return { ok: false, detail: "set 需要 path 和 value。例：settings set enableReports true" };
+        }
+        // 群友模式配置走 friendmode 独立文件（friend.* 路径）
+        if (args.path.startsWith("friend.")) {
+          const fm = await readFriendConfig();
+          const sub = args.path.slice("friend.".length); // enabled / nickname / blacklist.groups ...
+          const isArrayAppend = /\+=\[/.test(args.value);
+          const rawValue = args.value.replace(/^\+=\[/, "").replace(/\]$/, "");
+          if (sub === "enabled") {
+            fm.enabled = rawValue === "true";
+            await writeFriendConfig(fm);
+            return { ok: true, detail: `群友模式已${fm.enabled ? "开启" : "关闭"}。` };
+          }
+          if (sub === "nickname") {
+            fm.nickname = rawValue.replace(/^['\"]|['\"]$/g, "");
+            await writeFriendConfig(fm);
+            return { ok: true, detail: `群友称呼已设为「${fm.nickname}」。` };
+          }
+          if (sub === "blacklist.groups" || sub === "blacklist.users") {
+            const key = sub === "blacklist.groups" ? "groups" : "users";
+            const list = fm.blacklist[key] ?? [];
+            const items = rawValue.split(",").map((s) => s.replace(/^['\"]|['\"]$/g, "").trim()).filter(Boolean);
+            for (const item of items) {
+              if (isArrayAppend) { if (!list.includes(item)) list.push(item); }
+              else { const idx = list.indexOf(item); if (idx >= 0) list.splice(idx, 1); }
+            }
+            fm.blacklist[key] = list;
+            await writeFriendConfig(fm);
+            await appendFriendMemory({ kind: "system", text: `黑名单${isArrayAppend ? "添加" : "移除"} ${items.join(",")}` }).catch(() => {});
+            return { ok: true, detail: `群友黑名单${isArrayAppend ? "添加" : "移除"} ${items.join(", ")}。当前 ${key}: ${list.join(", ") || "无"}` };
+          }
+          if (sub === "readOnly") {
+            fm.readOnly = rawValue === "true";
+            await writeFriendConfig(fm);
+            return { ok: true, detail: `群友只读模式已${fm.readOnly ? "开启" : "关闭"}。` };
+          }
+          return { ok: false, detail: `未知群友配置路径 ${args.path}。支持: friend.enabled / friend.nickname / friend.readOnly / friend.blacklist.groups / friend.blacklist.users` };
+        }
+        const presetPath = await resolvePresetPath();
+        if (!presetPath) return { ok: false, detail: "无法定位 preset 配置文件。" };
+        const { readFile, writeFile } = await import("node:fs/promises");
+        try {
+          let content = await readFile(presetPath, "utf8");
+          // 用文本替换处理简单标量 / 数组追加（保留 yml 注释）
+          const isArrayAppend = /\+=\[/.test(args.value);
+          const rawValue = args.value.replace(/^\+=\[/, "").replace(/\]$/, "");
+          let handled = false;
+          // 简单标量替换：path 的最后一段对应 yml 里的键
+          const key = args.path.split(".").pop();
+          const boolVal = rawValue === "true" ? "true" : rawValue === "false" ? "false" : undefined;
+          if (!isArrayAppend && boolVal !== undefined) {
+            const re = new RegExp(`(${key}:\\s*)(true|false)`, "g");
+            if (re.test(content)) {
+              content = content.replace(re, `$1${boolVal}`);
+              handled = true;
+            }
+          }
+          if (!handled && !isArrayAppend && /^[A-Za-z0-9_\-\u4e00-\u9fff]+$/.test(rawValue)) {
+            const re = new RegExp(`(${key}:\\s*)['\"]?[^'\"]*['\"]?`);
+            if (re.test(content)) {
+              content = content.replace(re, `$1'${rawValue}'`);
+              handled = true;
+            }
+          }
+          if (!handled && isArrayAppend) {
+            // 数组追加：找到 key: [...] 列表，插入元素
+            const items = rawValue.split(",").map((s) => s.trim().replace(/^['\"]|['\"]$/g, "")).filter(Boolean);
+            const listRe = new RegExp(`(${key}:\\s*\\[)([\\s\\S]*?)(\\])`);
+            const m = listRe.exec(content);
+            if (m) {
+              const existing = m[2].trim() ? m[2].trim() : "";
+              const newItems = items.map((i) => `'${i}'`).join(", ");
+              const merged = existing ? `${existing}, ${newItems}` : newItems;
+              content = content.replace(listRe, `$1${merged}$3`);
+              handled = true;
+            }
+          }
+          if (!handled) {
+            return { ok: false, detail: `未能自动修改 ${args.path}（路径或格式不支持）。当前值：${JSON.stringify(getByPath(resolved, args.path))}。请手动编辑 preset 文件。` };
+          }
+          await writeFile(presetPath, content, "utf8");
+          return { ok: true, detail: `已修改 ${args.path}。重启 DSH 后生效。` };
+        } catch (error) {
+          return { ok: false, detail: `修改失败: ${error instanceof Error ? error.message : String(error)}` };
+        }
+      }
+      return { ok: false, detail: `未知操作 ${args.action}。` };
+    },
+    presentCall: (args) => ({
+      card: "generic",
+      title: "Settings",
+      kind: "other",
+      rawInput: args.action + (args.path ? " " + args.path : ""),
+    }),
+  }));
   // 知识库目录：$DSH_HOME/knowledge/（默认 ~/.dsh/knowledge），markdown 文档持久保存。
   ctx.tools.register(defineTool({
     name: "learn_skill",

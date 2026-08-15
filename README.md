@@ -248,6 +248,34 @@ $DSH_HOME\profiles\node_modules\
 
 重启 DSH 后生效。**密钥永远不会写进任何配置文件**。
 
+## ⚙️ 对话内配置（settings 工具）
+
+所有配置都可以在对话里完成，不用手动编辑 yml：
+
+```text
+你：「看下配置」→ 鲸鱼娘用 settings get 列出全部功能模块和当前值
+你：「开启群友模式，屏蔽群123，我叫小鲸」
+  → settings set friend.nickname 小鲸
+  → settings set friend.blacklist.groups+=["123"]
+  → settings set friend.enabled true
+你：「定时汇报关掉」→ settings set enableReports false
+你：「只允许我指挥」→ settings set accessControl.mode whitelist
+```
+
+**常用路径**：
+
+| 路径 | 含义 | 示例 |
+| --- | --- | --- |
+| `enableReports` | 定时汇报开关 | `settings set enableReports true` |
+| `friend.enabled` | 群友模式开关 | `settings set friend.enabled true` |
+| `friend.nickname` | 群友称呼 | `settings set friend.nickname 小鲸` |
+| `friend.readOnly` | 群友只读 | `settings set friend.readOnly true` |
+| `friend.blacklist.groups` | 屏蔽群（`+=` 追加） | `settings set friend.blacklist.groups+=["123"]` |
+| `friend.blacklist.users` | 屏蔽用户 | `settings set friend.blacklist.users+=["999"]` |
+| `accessControl.mode` | 白名单/开放 | `settings set accessControl.mode whitelist` |
+
+> 修改后**重启 DSH 生效**。`friend.*` 配置独立存于 `$DSH_HOME\friendmode\config.json`。
+
 ## 🔐 访问控制（黑白名单）
 
 只有你（或你指定的人）能通过飞书/QQ 指挥鲸鱼娘，其他人发消息**无反应**（不注入会话，仅记日志）。
