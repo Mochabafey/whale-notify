@@ -149,9 +149,12 @@ $DSH_HOME\profiles\node_modules\
 
 #### 📅 定时汇报
 
+**默认关闭**：需要显式 `enableReports: true` 才会启用（避免别人复制配置后被动开启）。
+
 **配置**（`reports` 数组，可多条）：
 
 ```yaml
+    enableReports: true                    # 总开关：默认 false（关闭）
     reports:
       - name: '每日晨报'                  # 汇报名称（作为通知标题）
         channel: 'feishu_bot'             # 推送渠道（已配置的：feishu_bot / smtp / qq 等）

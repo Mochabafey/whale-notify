@@ -74,8 +74,9 @@
     #   wsPort: 3001                    # 本插件监听反向 WS 的端口
     #   targetSession: ''
 
-    # ── 定时汇报 ──
+    # ── 定时汇报（默认关闭，需 enableReports: true 显式开启）──
     # schedule："daily:HH:MM"（每日定点）或 "every:N"（每 N 分钟，N>=5）
+    # enableReports: false
     # reports:
     #   - name: '每日晨报'
     #     channel: 'feishu_bot'

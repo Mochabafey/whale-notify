@@ -440,6 +440,8 @@ const Config = z.object({
     rejectUnauthorized: z.boolean(),
   }),
   pollIntervalMs: z.number(),
+  // 定时汇报总开关：默认 false（关闭）。设为 true 且配置了 reports 才启用。
+  enableReports: z.boolean().default(false),
   // 定时汇报：{ name, channel, schedule, text } 数组。
   // schedule 格式："daily:HH:MM"（每日定点）或 "every:N"（每 N 分钟，N>=5）。
   reports: z.array(z.object({
@@ -549,9 +551,11 @@ function apply(ctx, config) {
   }
 
   // 定时汇报：到点通过 notify 推送到配置的渠道（飞书/QQ/邮件等）。
-  // reports: [{ name, channel, schedule: "daily:09:00" | "every:<min>", text }]
+  // 需 enableReports: true 才会启用（默认关闭，避免别人复制配置后被动开启）。
+  // reports: [{ name, channel, schedule: "daily:HH:MM" | "every:<min>", text }]
   const reports = Array.isArray(resolved.reports) ? resolved.reports : [];
-  if (reports.length > 0 && typeof ctx.interval === "function") {
+  const reportsEnabled = resolved.enableReports === true;
+  if (reportsEnabled && reports.length > 0 && typeof ctx.interval === "function") {
     const fire = (report) => {
       // 用 notify 的发送链路（复用 trySend 逻辑，无需 agent）
       trySend(report.channel, resolved, `【定时汇报】${report.name}`, report.text, env)
