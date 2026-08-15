@@ -1,6 +1,11 @@
 # dsh-whale-notify（鲸鱼通知）
 
-DeepSeek Harness（DSH）的通知、邮件问答与飞书机器人插件。
+DeepSeek Harness（DSH）的通知、聊天机器人、记忆与学习插件。
+
+> 📚 **完整文档**：
+> - 主文档：`whale-notify/README.md`
+> - [会话内配置指南](../docs/会话内配置.md)
+> - [外部服务配置指南（NapCat/飞书/邮箱）](../docs/外部服务配置.md)
 
 ## 工具
 

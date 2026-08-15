@@ -1,412 +1,121 @@
-# 🐋 Whale Notify（鲸鱼通知）—— DeepSeek Harness 通知、聊天机器人与定时汇报插件
+# 🐋 Whale Notify（鲸鱼通知）—— DeepSeek Harness 通知、聊天机器人与记忆插件
 
-给 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 的 agent 注入鲸鱼娘的灵魂：一个 **鲸鱼娘人设**，和一个**能发通知、能收回复、能听你指挥**的插件——支持**飞书/QQ 双向聊天**、邮件问答、定时汇报、多渠道通知。
+给 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 的 agent 注入鲸鱼娘的灵魂：一个 **鲸鱼娘人设**，和一个**能发通知、能收回复、能听你指挥、有记忆会学习**的插件——支持**飞书/QQ 双向聊天**、群友模式、邮件问答、定时汇报、统一记忆库、技能知识库。
 
 > 人设灵感来自 [萌娘百科·DeepSeek娘](https://zh.moegirl.org.cn/DeepSeek%E5%A8%98)（白发蓝瞳、鲸鱼尾巴、傲娇天才）。
 
-## ✨ 功能一览
+## ✨ 功能全景
 
-| 插件 | 工具/能力 | 说明 |
+| 能力 | 说明 | 工具 |
 | --- | --- | --- |
-| **dsh-whale-notify**（鲸鱼通知） | `notify` | 任务完成/失败通知 → 飞书开放平台、QQ（NapCat）、微信（Server酱）、飞书 webhook、企业微信、钉钉、邮箱 |
-| | **飞书双向聊天** | 你在飞书里给机器人发消息 → 注入 DSH 会话 → agent 执行；任务结果可推回飞书 |
-| | **QQ 双向聊天** | 通过 NapCat（OneBot）收发 QQ 消息，注入 DSH 会话 |
-| | **群友模式** | QQ 群里像真实网友互动：黑名单、@/回复触发、独立称呼/记忆/提示词 |
-| | **定时汇报** | 每日定点/定期推送状态到飞书或 QQ（`daily:HH:MM` / `every:N`，`enableReports` 开关） |
-| | **记忆模式** | 新会话可恢复历史会话记忆（`recall_memory`，AI 主动询问） |
-| | **学习模式** | 学会新技能询问用户 → `learn_skill` 存知识库 → `recall_skill` 调取 |
-| | `notify(awaitReply:true)` | 邮件通知**可回复指挥**：回复邮件即可给 agent 下达下一步指令 |
-| | `ask_user_email` | agent 通过邮件提问/审批，你回复后答案**自动注入会话** |
-| **鲸鱼娘 persona** | — | 傲娇天才 AI 人设（附完整工作准则，先干活再卖萌） |
+| 📢 **多渠道通知** | 任务完成/失败通知：飞书开放平台、QQ（NapCat）、微信 Server酱、飞书 webhook、企业微信、钉钉、邮箱 | `notify` |
+| 💬 **飞书双向聊天** | 你在飞书给机器人发消息 → 注入 DSH 会话 → agent 执行；结果推回飞书 | 内置（长连接） |
+| 💬 **QQ 双向聊天** | 通过 NapCat（OneBot）收发 QQ 消息，注入 DSH 会话 | 内置（反向 WS） |
+| 👥 **群友模式** | QQ 群里像真实网友互动：黑名单、@/回复触发、独立称呼/记忆/提示词 | `friend_mode` / `settings` |
+| 🔐 **访问控制** | 只有白名单用户能指挥，名单外无反应，只读用户标记 | `settings` |
+| 📅 **定时汇报** | 每日定点/定期推送（`daily:HH:MM` / `every:N`，默认关闭） | `settings` |
+| 🧠 **统一记忆库** | 保存会话总结、跨会话恢复、群友独立记忆（`$DSH_HOME/memory/`） | `save_memory` / `recall_memory` |
+| 🎓 **学习模式** | 学会新技能询问 → 存知识库 → 随时调取（`$DSH_HOME/knowledge/`） | `learn_skill` / `recall_skill` |
+| ✉️ **邮件问答** | agent 通过邮件提问/审批，你回复后答案自动注入会话；通知邮件可回复指挥 | `ask_user_email` / `notify(awaitReply)` |
+| ⚙️ **对话内配置** | 所有配置在对话里完成，不用手改 yml | `settings` |
+| 🐋 **鲸鱼娘 persona** | 傲娇天才 AI 人设，附完整工作准则 | 内置 |
+
+## 📚 文档索引
+
+| 文档 | 内容 |
+| --- | --- |
+| **本文件** | 功能总览、安装、快速开始 |
+| [📖 会话内配置指南](docs/会话内配置.md) | `settings` 工具、模式切换、全部配置路径 |
+| [📖 外部服务配置指南](docs/外部服务配置.md) | QQ（NapCat）、飞书开放平台、邮箱 SMTP/IMAP 的申请与配置 |
 
 ## 📦 目录结构
 
 ```text
 whale-notify/
 ├── README.md                          # 本文件
+├── docs/
+│   ├── 会话内配置.md                   # settings 工具与模式切换
+│   └── 外部服务配置.md                 # NapCat / 飞书 / 邮箱配置
 ├── examples/
-│   └── agent.cordis.whale.yml         # 脱敏的 preset 配置示例（可直接参考）
+│   └── agent.cordis.whale.yml         # 脱敏的 preset 配置示例
 ├── plugins/
-│   └── dsh-whale-notify/              # 鲸鱼通知插件（包名 dsh-whale-notify）
+│   └── dsh-whale-notify/              # 鲸鱼通知插件
 │       ├── package.json
 │       └── lib/
-│           ├── index.js               # 插件主体：工具 + 消息注入 + 定时汇报
-│           ├── feishu.js              # 飞书开放平台：token/发消息/长连接接收（官方 SDK）
-│           ├── qq.js                  # QQ（OneBot/NapCat）：发送 + 反向 WS 接收
-│           ├── knowledge.js           # 学习模式知识库（markdown 持久保存）
-│           ├── smtp.js                # 手写 SMTP 客户端（零依赖）
-│           ├── imap.js                # IMAP 轮询 + 邮件解析
-│           └── ask.js                 # 决策状态管理 + 回复注入
-└── verify-notify.mjs                  # 通知插件自测脚本（可选）
+│           ├── index.js               # 插件主体：全部工具 + 消息注入 + 定时汇报
+│           ├── feishu.js              # 飞书开放平台（官方 SDK 长连接）
+│           ├── qq.js                  # QQ OneBot（发送 + 反向 WS 接收）
+│           ├── friendmode.js          # 群友模式（称呼/黑名单/提示词）
+│           ├── memory.js              # 统一记忆库（conversations/friend/summaries）
+│           ├── knowledge.js           # 学习知识库
+│           ├── smtp.js                # 手写 SMTP 客户端
+│           ├── imap.js                # IMAP 轮询
+│           └── ask.js                 # 邮件问答决策管理
+└── verify-notify.mjs                  # 通知插件自测脚本
 ```
 
-## 🚀 安装（三步）
+## 🚀 快速开始
 
 ### 1. 放置插件
 
-把 `plugins/dsh-whale-notify` 文件夹复制到 DSH profile 的 node_modules：
+把 `plugins/dsh-whale-notify` 复制到 DSH profile 的 node_modules：
 
 ```text
-$DSH_HOME\profiles\node_modules\
-└── dsh-whale-notify\
+$DSH_HOME\profiles\node_modules\dsh-whale-notify\
 ```
 
-并在 `$DSH_HOME\profiles\web\package.json` 的 `dependencies` 里登记（可选，便于 pnpm 管理）：
-
-```json
-"dependencies": {
-  "dsh-whale-notify": "file:<你的路径>/whale-notify/plugins/dsh-whale-notify"
-}
-```
-
-> ⚠️ **运行时依赖**（安装到同一 node_modules 目录）：
+> ⚠️ 运行时依赖（装到同一 node_modules 目录）：
 > ```sh
 > cd <profile 目录> && npm install imapflow @larksuiteoapi/node-sdk
 > ```
-> - `imapflow` — `ask_user_email` 收信需要（IMAP）
-> - `@larksuiteoapi/node-sdk` — 飞书开放平台长连接接收需要
 
 ### 2. 配置 preset
 
-参考 `examples/agent.cordis.whale.yml`，把内容合并进你的 agent preset 的 `agent.cordis.yml`
-（用户 preset 位于 `$DSH_HOME\.agent-presets\<你的预设>\`，或新建一个）。
+参考 `examples/agent.cordis.whale.yml`，把内容合并进你的 agent preset 的 `agent.cordis.yml`（用户 preset 位于 `$DSH_HOME\.agent-presets\<你的预设>\`）。
 
-### 3. 配置渠道
+### 3. 配置外部服务
 
-编辑 preset 的 `agent.cordis.yml`，在 `tool-notify` 的 `config` 下按需启用渠道
-（完整示例见 `examples/agent.cordis.whale.yml`）。密钥一律用 `$ENV:变量名` 引用。
-
-#### 📧 邮箱（SMTP + IMAP）—— 支持通知、邮件问答、回复指挥
-
-```yaml
-    smtp:
-      host: 'smtp.feishu.cn'          # 你的邮箱发信服务器
-      port: 587                       # 587=STARTTLS；465=隐式SSL(secure:true)
-      secure: false
-      user: 'your-mailbox@example.com'
-      pass: '$ENV:MAIL_PASS'          # 邮箱专用密码/授权码
-      from: 'your-mailbox@example.com'
-      to: ['you@example.com']         # 收件人
-    imap:
-      host: 'imap.feishu.cn'          # 收信服务器（ask_user_email 用）
-      port: 993
-      secure: true
-      user: 'your-mailbox@example.com'
-      pass: '$ENV:MAIL_PASS'          # 同一个授权码
-      mailbox: 'INBOX'
-    pollIntervalMs: 30000             # 轮询间隔（毫秒）
-```
-
-> ⚠️ 各邮箱的授权码互不通用：飞书用「专用密码」、QQ 用「授权码」、163 用「客户端授权码」、
-> Gmail 用「应用专用密码」。每个邮箱单独开启 SMTP/IMAP 服务后各拿各的码。
-
-#### 💬 飞书开放平台（自建应用）—— 双向聊天，可收发
-
-**能力**：你在飞书里给机器人发消息 → 注入 DSH 会话 → agent 执行；`notify` 也能推消息回飞书。
-
-**飞书后台准备**（[open.feishu.cn/app](https://open.feishu.cn/app)）：
-1. 创建**自建应用**，记下 App ID / App Secret
-2. **事件与回调** → 订阅方式选 **「使用长连接接收事件/回调」**
-3. **事件**：添加 **`im.message.receive_v1`**（接收消息）
-4. **权限管理**：开通 **`im:message`**（获取与发送单聊、群组消息）等
-5. **版本管理与发布**：创建版本并**发布**（自建应用改配置必须发布才生效）
-
-**配置**：
-
-```yaml
-    feishuBot:
-      appId: '$ENV:FEISHU_APP_ID'          # 环境变量引用，勿写明文
-      appSecret: '$ENV:FEISHU_APP_SECRET'
-      receiveId: 'oc_xxxxxxxxxxxxxxxx'      # 目标会话 chat_id / open_id（私聊给机器人发条消息即可在日志/事件中看到）
-      receiveIdType: 'chat_id'             # chat_id / open_id / user_id
-      targetSession: ''                    # 可选：飞书消息注入哪个 DSH 会话（sessionId）；留空=最近活跃会话
-```
-
-**环境变量**：
-
-```powershell
-[Environment]::SetEnvironmentVariable("FEISHU_APP_ID", "cli_xxxxxxxxxxxx", "User")
-[Environment]::SetEnvironmentVariable("FEISHU_APP_SECRET", "你的AppSecret", "User")
-```
-
-> 💡 长连接由官方 `@larksuiteoapi/node-sdk` 处理（token 刷新、protobuf 解码、自动重连）。
-> 自建应用的 App Secret 是敏感凭证，泄露后请到后台重置。
-
-#### 💬 QQ（OneBot / NapCat）—— 双向聊天
-
-**前提**：本机运行 [NapCat](https://github.com/NapNeko/NapCatQQ)（登录一个 QQ 号），HTTP API 默认 `http://127.0.0.1:3000`。
-
-**NapCat 安装（Windows，用已安装的 QQ）**：
-
-1. 从 [Releases](https://github.com/NapNeko/NapCatQQ/releases) 下载 **`NapCat.Shell.zip`**（不是 OneKey 版——OneKey 会自动下载 QQ 且易 404；Shell 版直接挂载已装的 QQ）
-2. 解压后，确保 QQ NT 版已安装（`C:\Program Files\Tencent\QQNT\`）
-3. 双击 **`launcher-user.bat`**（用户版，无需管理员）启动；首次会拉起 QQ 登录
-4. 登录后 NapCat 自动运行，`config/onebot11_<QQ号>.json` 会生成
-5. **编辑 `onebot11_<QQ号>.json`** 启用 OneBot：`network.httpServers` 加 HTTP 3000，`network.websocketClients` 加 `ws://127.0.0.1:3001`（连插件反向 WS）
-6. 重启 NapCat 生效
-
-**配置**：
-
-```yaml
-    qq:
-      httpBase: 'http://127.0.0.1:3000'   # OneBot HTTP API
-      accessToken: ''                     # OneBot 访问令牌（可选）
-      qq: '123456789'                     # 私聊目标 QQ 号
-      groupId: ''                         # 或填群号（二选一，优先群）
-      wsPort: 3001                        # 本插件监听反向 WS 的端口
-      targetSession: ''                   # 可选：QQ 消息注入哪个 DSH 会话
-```
-
-> 💡 反向 WS：在 NapCat 的 OneBot 配置里添加「反向 WebSocket」指向 `ws://127.0.0.1:3001`，
-> 插件即能接收 QQ 消息并注入会话。
-
-#### 📅 定时汇报
-
-**默认关闭**：需要显式 `enableReports: true` 才会启用（避免别人复制配置后被动开启）。
-
-**配置**（`reports` 数组，可多条）：
-
-```yaml
-    enableReports: true                    # 总开关：默认 false（关闭）
-    reports:
-      - name: '每日晨报'                  # 汇报名称（作为通知标题）
-        channel: 'feishu_bot'             # 推送渠道（已配置的：feishu_bot / smtp / qq 等）
-        schedule: 'daily:09:00'           # daily:HH:MM 每日定点；或 every:N 每 N 分钟（N>=5）
-        text: '🐋 鲸鱼娘每日晨报：新的一天开始了！'
-```
-
-**schedule 格式**：
-- `daily:09:00` — 每天 09:00 推送
-- `every:30` — 每 30 分钟推送
-
-> 内容当前为静态文本模板（如含会话数/任务数等动态信息的日报需要 agent 驱动，属后续增强）。
-
-#### 💬 飞书群机器人（webhook）—— 只发通知，最简接入
-
-1. 飞书群 → 设置 → 群机器人 → 添加机器人 → **自定义机器人**
-2. 复制 Webhook 地址；若创建时选「签名校验」，记下签名密钥
-3. 配置：
-
-```yaml
-    feishu:
-      webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx'
-      secret: '$ENV:FEISHU_BOT_SECRET'   # 可选：签名校验密钥
-```
-
-#### 💬 微信（Server酱）—— 微信推送通知
-
-1. 微信扫码登录 https://sct.ftqq.com 拿 SendKey
-2. 配置：
-
-```yaml
-    serverchan:
-      sendKey: '$ENV:SERVERCHAN_SEND_KEY'
-```
-
-#### 💬 企业微信群机器人
-
-```yaml
-    wecom:
-      webhook: '$ENV:WECOM_WEBHOOK'
-```
-
-#### 💬 钉钉群机器人
-
-```yaml
-    dingtalk:
-      webhook: '$ENV:DINGTALK_WEBHOOK'
-      secret: '$ENV:DINGTALK_SECRET'   # 可选：加签密钥
-```
-
-> 📝 **渠道能力一览**：
->
-> | 渠道 | 发通知 | 回复指挥 | 说明 |
-> | --- | --- | --- | --- |
-> | **飞书开放平台**（自建应用） | ✅ | ✅（飞书里直接回复） | 双向聊天，实时注入会话 |
-> | **QQ（NapCat / OneBot）** | ✅ | ✅（QQ 里直接回复） | 双向聊天，实时注入会话 |
-> | 邮箱 SMTP/IMAP | ✅ | ✅（回复邮件） | 全功能 |
-> | 飞书 webhook | ✅ | ❌（单向） | 最简单，只发不收 |
-> | 微信 Server酱 | ✅ | ❌（单向） | |
-> | 企业微信 | ✅ | ❌（单向） | |
-> | 钉钉 | ✅ | ❌（单向） | |
->
-> 另有 **定时汇报**（`reports`）：每日定点/定期推送到任一已配置渠道。
+按 [📖 外部服务配置指南](docs/外部服务配置.md) 申请/配置：
+- **飞书开放平台应用**（双向聊天）
+- **NapCat + QQ**（QQ 双向聊天）
+- **邮箱 SMTP/IMAP**（邮件通知/问答）
 
 ### 4. 设置密钥环境变量
 
 ```powershell
-# 邮箱授权码（发/收信共用）
-[Environment]::SetEnvironmentVariable("MAIL_PASS", "你的专用密码", "User")
-# 飞书开放平台 App ID / App Secret（自建应用）
-[Environment]::SetEnvironmentVariable("FEISHU_APP_ID", "cli_xxxxxxxxxxxx", "User")
-[Environment]::SetEnvironmentVariable("FEISHU_APP_SECRET", "你的AppSecret", "User")
-# 飞书机器人签名密钥（如果创建时加了签）
-[Environment]::SetEnvironmentVariable("FEISHU_BOT_SECRET", "你的密钥", "User")
-# 微信 SendKey
-[Environment]::SetEnvironmentVariable("SERVERCHAN_SEND_KEY", "你的SendKey", "User")
+# 飞书开放平台
+[Environment]::SetEnvironmentVariable("FEISHU_APP_ID", "cli_xxx", "User")
+[Environment]::SetEnvironmentVariable("FEISHU_APP_SECRET", "xxx", "User")
+# 邮箱授权码
+[Environment]::SetEnvironmentVariable("MAIL_PASS", "xxx", "User")
 ```
 
-重启 DSH 后生效。**密钥永远不会写进任何配置文件**。
+> 🔑 **密钥只进环境变量，永不写进配置文件**。设置后需**新开窗口**重启 DSH（环境变量才会生效）。
 
-## ⚙️ 对话内配置（settings 工具）
+### 5. 重启并开始使用
 
-所有配置都可以在对话里完成，不用手动编辑 yml：
-
-```text
-你：「看下配置」→ 鲸鱼娘用 settings get 列出全部功能模块和当前值
-你：「开启群友模式，屏蔽群123，我叫小鲸」
-  → settings set friend.nickname 小鲸
-  → settings set friend.blacklist.groups+=["123"]
-  → settings set friend.enabled true
-你：「定时汇报关掉」→ settings set enableReports false
-你：「只允许我指挥」→ settings set accessControl.mode whitelist
+```powershell
+dsh web
 ```
 
-**常用路径**：
-
-| 路径 | 含义 | 示例 |
-| --- | --- | --- |
-| `enableReports` | 定时汇报开关 | `settings set enableReports true` |
-| `friend.enabled` | 群友模式开关 | `settings set friend.enabled true` |
-| `friend.nickname` | 群友称呼 | `settings set friend.nickname 小鲸` |
-| `friend.readOnly` | 群友只读 | `settings set friend.readOnly true` |
-| `friend.blacklist.groups` | 屏蔽群（`+=` 追加） | `settings set friend.blacklist.groups+=["123"]` |
-| `friend.blacklist.users` | 屏蔽用户 | `settings set friend.blacklist.users+=["999"]` |
-| `accessControl.mode` | 白名单/开放 | `settings set accessControl.mode whitelist` |
-
-> 修改后**重启 DSH 生效**。`friend.*` 配置独立存于 `$DSH_HOME\friendmode\config.json`。
-
-## 🔐 访问控制（黑白名单）
-
-只有你（或你指定的人）能通过飞书/QQ 指挥鲸鱼娘，其他人发消息**无反应**（不注入会话，仅记日志）。
-
-```yaml
-    accessControl:
-      mode: 'whitelist'                     # whitelist=仅白名单可指挥；open=所有人（默认）
-      allowedUsers:
-        feishu:
-          - 'ou_xxxxxxxxxxxxxxxx'           # 你的飞书 open_id（收到消息后从日志中可看到）
-        qq:
-          - '123456789'                     # 你的 QQ 号
-      readOnlyUsers:
-        feishu: []
-        qq: []                              # 只读用户：可发消息但 agent 标记为只读，不执行修改操作
-```
-
-- **白名单用户**：可正常下达指令
-- **只读用户**：消息注入但带 `[只读消息]` 标记，agent 不执行修改性操作
-- **名单外用户**：消息被忽略（无反应），记录 `qq_denied` / `feishu_denied` 日志
-
-## 💬 飞书双向聊天（核心玩法）
-
-你在飞书里给「鲸鱼娘」机器人发消息 → 长连接实时收到 → 注入 DSH 会话 →
-agent 把消息当作你的指令执行 → 结果可通过 `notify(channel: "feishu_bot")` 推回飞书。
-
-```text
-你（飞书）──消息──▶ 鲸鱼娘机器人 ──长连接──▶ DSH 会话（agent 执行）
-                                              │
-你 ◀──通知/结果──── notify(feishu_bot) ◀──────┘
-```
-
-## 👥 群友模式（QQ 群聊互动）
-
-让鲸鱼娘在 QQ 群里像真实网友一样聊天，而不是工作助手。
-
-**开启方式**（对话内）：
-1. 对鲸鱼娘说「开启群友模式」
-2. 它先确认是否切换**只读模式**（readOnly：只回复不执行修改操作）
-3. **首次开启**会询问「想让大家怎么称呼你？」，填入后保存到独立文件
-4. 之后可用 `friend_mode` 工具管理：`on/off/set_nickname/block_group/block_user/status`
-
-**触发回复规则**（群友模式开启后）：
-- ✅ 被 **@**、被**回复/引用**、消息中**提到你的称呼**、或**私聊** → 回应
-- ❌ 普通群聊没人找你 → 不插话（像真实网友）
-
-**黑名单**：`friend_mode(action: block_group, value: 群号)` 屏蔽群；`block_user` 屏蔽用户。被屏蔽的群/用户消息完全忽略。
-
-**独立配置与记忆**（`$DSH_HOME\friendmode\`，可编辑）：
-- `config.json` — 开关/称呼/只读/黑名单
-- `prompts.md` — 回复风格提示词（默认：简短、口语化、像真实网友，可自定义）
-- `memory.jsonl` — 独立的群聊记忆（只记群友模式下的互动）
-
-## 🧠 记忆模式（统一记忆库）
-
-**统一记忆库**：所有记忆集中在 `$DSH_HOME\memory\`：
-
-```text
-memory\
-├── conversations\   # 跨会话记忆（每次保存的会话总结文档）
-├── friend\          # 群友模式记忆（JSONL）
-└── summaries\       # 手动总结文档
-```
-
-**保存记忆**（`save_memory`）：
-- 你说「保存记忆」「记住这个」「总结一下存起来」→ agent 压缩本次对话要点存成文档
-- 工作完成/对话告一段落时，agent 会主动问「要把这次内容存成记忆吗？」
-
-```text
-你：「保存当前记忆」
-agent：总结本次会话 → save_memory("股市复盘-2026-08-14", "要点…", tags:["股市"]) → 存入 memory\conversations\
-```
-
-**恢复记忆**（`recall_memory`）：
-- 先搜统一记忆库（总结文档，快且准）
-- 没找到再翻官方会话记录（`sessions\`，DSH 自动保存）
-
-```text
-你：「恢复昨天股市复盘的记忆」
-agent：recall_memory("股市复盘") → 命中记忆库文档 → 注入内容 → 继续工作
-```
-
-> 群友模式记忆也并入记忆库（`memory\friend\`），旧数据自动迁移。
-
-## 🎓 学习模式（技能知识库）
-
-鲸鱼娘在对话中学到新技能/经验时，会**先询问你是否记录**，确认后存进知识库：
-
-1. 用户教了新方法，或鲸鱼娘摸索出新用法 → 询问「要不要记到知识库？」
-2. 你同意 → `learn_skill(title, content, tags?)` 保存为 markdown
-3. 之后需要时 → `recall_skill(query)` 搜索调取
-
-```text
-你：「把飞书发消息的步骤记下来」
-agent：learn_skill("飞书发消息", "步骤…", ["飞书", "通知"])
-你（以后）：「上次飞书通知是怎么配的？」
-agent：recall_skill("飞书") → 返回记录内容
-```
-
-知识库位置：`$DSH_HOME\knowledge\`（默认 `~/.dsh/knowledge`），markdown 文档持久保存。
-
-## 📧 邮件回复指挥 & 问答（核心玩法）
-### 通知可回复指挥
-agent 调用 `notify(awaitReply: true)` 发出完成通知邮件 → 邮件主题带 `[DSH:编号]`，
-正文提示「回复此邮件可直接给 agent 下达下一步指令」→ 你回复邮件写下新指令 →
-插件每 30 秒轮询收件箱 → 匹配决策编号 → `用户通过邮件下达新指令：…` 注入会话 → agent 继续执行。
-
-### 邮件问答
-agent 调用 `ask_user_email(question, context?, options?)` → 发询问邮件 →
-你回复（如「继续」「取消」或自定义内容）→ 回复自动注入会话 → agent 据此继续。
+新建会话选 **鲸鱼娘** preset。之后**所有配置都可以在对话里完成**，详见 [📖 会话内配置指南](docs/会话内配置.md)。
 
 ## 🔐 隐私与安全
 
-- **密钥零明文**：所有密码/令牌一律 `$ENV:变量名` 引用，源码与配置文件中不含真实密钥。
-- **本仓库不含任何真实信息**：示例配置的邮箱均为占位符（`your@example.com`）。
-- **提交前自查**：不要提交 `$DSH_HOME\`（含 `.credentials.yaml` 与聊天记录）、
-  日志文件、以及任何含真实邮箱/密钥的文件。
-- **建议**：如果密钥曾在聊天中出现过，请重置后更新环境变量。
+- 密钥一律 `$ENV:变量名` 引用，源码与配置示例不含真实密钥/邮箱/密码
+- 本仓库不含任何真实信息（示例均为占位符）
+- 记忆、聊天记录、日志全在 `$DSH_HOME\`（私密区），`.gitignore` 保护，不随仓库提交
+- App Secret 若曾在聊天中出现，建议到后台重置
 
 ## 🧪 自测
 
 ```sh
-node verify-notify.mjs    # mock HTTP + TLS SMTP 服务器，验证 5 个发送渠道 + SMTP 全流程（14 项检查）
+node verify-notify.mjs    # mock HTTP + TLS SMTP，验证发送渠道与 SMTP 全流程（需 openssl）
 ```
-
-> 需要系统 `openssl`（生成一次性测试证书；Git for Windows 自带）。若插件未安装到 DSH，可设置
-> `DSH_HOME` 环境变量指向你的 DSH 用户目录后再运行。
 
 ## 📄 许可
 
-MIT。人设部分基于萌娘百科 DeepSeek娘条目（社区创作），非商业用途。
+MIT。人设基于萌娘百科 DeepSeek娘条目（社区创作），非商业用途。
 
 ---
 
