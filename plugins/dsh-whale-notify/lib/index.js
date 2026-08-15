@@ -8,6 +8,10 @@ import { registerPending, pollAndInject, decisionTag } from "./ask.js";
 import { getTenantToken, sendText, startLongConnection, extractMessageEvent } from "./feishu.js";
 import { sendQQ, startQQReceiver } from "./qq.js";
 import { saveSkill, searchSkills, readSkill, knowledgeDir } from "./knowledge.js";
+import {
+  readFriendConfig, writeFriendConfig, readFriendPrompts, appendFriendMemory,
+  readFriendMemory, isBlacklisted, buildFriendPrompt, friendModeDir,
+} from "./friendmode.js";
 
 /** Append one JSONL record to $DSH_HOME/logs/notify.log (creates dir/file). */
 async function appendLog(record) {
@@ -591,7 +595,46 @@ function apply(ctx, config) {
     try {
       const stopQQ = startQQReceiver(qqConfig, (msg) => {
         const label = msg.type === "group" ? `群 ${msg.groupId}` : `QQ ${msg.userId}`;
-        // 访问控制：白名单模式下非授权用户不注入（无反应，仅记日志）
+        // 群友模式：独立于主白名单的群聊互动逻辑
+        if (msg.type === "group") {
+          // 异步处理（friendmode 配置读取）
+          readFriendConfig().then((fm) => {
+            if (!fm.enabled) {
+              // 群友模式关闭：群消息按原访问控制处理（白名单内才注入）
+              const ac = isAllowed("qq", String(msg.userId));
+              if (!ac.allowed) {
+                appendLog({ ts: new Date().toISOString(), kind: "qq_denied", from: msg.userId, text: msg.text }).catch(() => {});
+                return;
+              }
+              injectToAgent(agents, qqConfig.targetSession, `QQ 消息（来自 ${label}）：${msg.text}`, "qq_in", msg.userId, { readOnly: ac.readOnly });
+              return;
+            }
+            // 群友模式开启：黑名单过滤
+            if (isBlacklisted(fm, msg.groupId, msg.userId)) {
+              appendLog({ ts: new Date().toISOString(), kind: "friend_blacklisted", group: msg.groupId, from: msg.userId, text: msg.text }).catch(() => {});
+              return;
+            }
+            // 触发条件：@ 机器人 / 回复引用 / 提到称呼 / 私聊（群消息里用 @ 和回复）
+            const mentioned = msg.atMe || msg.isReply || (fm.nickname && msg.text.includes(fm.nickname));
+            // 记录独立群友记忆
+            appendFriendMemory({ userId: msg.userId, groupId: msg.groupId, text: msg.text }).catch(() => {});
+            if (!mentioned) {
+              // 没被 @ 也没提到 → 不回复（像真实网友，不主动插话）
+              appendLog({ ts: new Date().toISOString(), kind: "friend_pass", group: msg.groupId, from: msg.userId, text: msg.text }).catch(() => {});
+              return;
+            }
+            // 命中触发：注入会话，带群友提示词
+            buildFriendPrompt(fm).then((prompt) => {
+              injectToAgent(agents, qqConfig.targetSession,
+                `【群友模式·群 ${msg.groupId}】来自 ${msg.userId}：${msg.text}\n\n${prompt}`,
+                "friend_in", msg.userId, { readOnly: fm.readOnly });
+            }).catch(() => {
+              injectToAgent(agents, qqConfig.targetSession, `【群友模式·群 ${msg.groupId}】来自 ${msg.userId}：${msg.text}`, "friend_in", msg.userId);
+            });
+          }).catch(() => {});
+          return;
+        }
+        // 私聊：按主访问控制处理
         const ac = isAllowed("qq", String(msg.userId));
         if (!ac.allowed) {
           appendLog({ ts: new Date().toISOString(), kind: "qq_denied", from: msg.userId, text: msg.text }).catch(() => {});
@@ -1063,6 +1106,94 @@ function apply(ctx, config) {
       title: "Recall skill",
       kind: "other",
       rawInput: args.query,
+    }),
+  }));
+
+  // ── friend_mode：群友模式（对话内开启/称呼/黑名单）──
+  ctx.tools.register(defineTool({
+    name: "friend_mode",
+    description:
+      "管理「群友模式」：在 QQ 群里像真实网友一样互动。可开启/关闭、设置称呼、管理黑名单。" +
+      "开启时需先确认是否切换到只读模式；首次开启会询问用户想让大家怎么称呼你。" +
+      "群友模式有独立的聊天记忆和回复风格提示词（存于 $DSH_HOME/friendmode/，可编辑）。",
+    parameters: {
+      action: {
+        type: "string",
+        required: true,
+        enum: ["on", "off", "set_nickname", "block_group", "unblock_group", "block_user", "unblock_user", "status"],
+        description: "on=开启；off=关闭；set_nickname=设置称呼；block_group=屏蔽群；unblock_group=取消屏蔽群；block_user=屏蔽用户；unblock_user=取消屏蔽用户；status=查看状态。",
+      },
+      value: {
+        type: "string",
+        description: "set_nickname 时填称呼；block_group/unblock_group 时填群号；block_user/unblock_user 时填 QQ 号。",
+      },
+    },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          ok: { type: "boolean", required: true },
+          detail: { type: "string", required: true },
+        },
+      },
+      render: (_args, value) => [{ type: "text", text: value.detail }],
+    },
+    async execute(args) {
+      const config = await readFriendConfig();
+      switch (args.action) {
+        case "on": {
+          if (!config.nickname) {
+            return { ok: false, detail: "首次开启群友模式需要先设置称呼——请先问用户想让大家怎么称呼，再调用 friend_mode(action: set_nickname, value: 称呼)，然后重新开启。" };
+          }
+          config.enabled = true;
+          await writeFriendConfig(config);
+          await appendFriendMemory({ kind: "system", text: "群友模式已开启" });
+          return { ok: true, detail: `群友模式已开启（昵称「${config.nickname}」，只读：${config.readOnly ? "是" : "否"}）。群友模式文件在 ${friendModeDir()}` };
+        }
+        case "off": {
+          config.enabled = false;
+          await writeFriendConfig(config);
+          await appendFriendMemory({ kind: "system", text: "群友模式已关闭" });
+          return { ok: true, detail: "群友模式已关闭。" };
+        }
+        case "set_nickname": {
+          if (!args.value) return { ok: false, detail: "请提供称呼（value 参数）。" };
+          config.nickname = String(args.value);
+          await writeFriendConfig(config);
+          await appendFriendMemory({ kind: "system", text: `称呼设置为 ${config.nickname}` });
+          return { ok: true, detail: `称呼已设置为「${config.nickname}」。在群聊中别人提到该称呼时你会回应。` };
+        }
+        case "block_group": case "unblock_group": case "block_user": case "unblock_user": {
+          if (!args.value) return { ok: false, detail: `请提供${args.action.includes("group") ? "群号" : "QQ号"}（value 参数）。` };
+          const key = args.action.includes("group") ? "groups" : "users";
+          const list = config.blacklist[key] ?? [];
+          if (args.action.startsWith("block")) {
+            if (!list.includes(String(args.value))) list.push(String(args.value));
+            config.blacklist[key] = list;
+            await writeFriendConfig(config);
+            return { ok: true, detail: `已屏蔽${args.action.includes("group") ? "群" : "用户"} ${args.value}。` };
+          } else {
+            config.blacklist[key] = list.filter((x) => x !== String(args.value));
+            await writeFriendConfig(config);
+            return { ok: true, detail: `已取消屏蔽${args.action.includes("group") ? "群" : "用户"} ${args.value}。` };
+          }
+        }
+        case "status": {
+          return {
+            ok: true,
+            detail: `群友模式：${config.enabled ? "已开启" : "已关闭"} | 称呼：${config.nickname || "未设置"} | 只读：${config.readOnly ? "是" : "否"} | 屏蔽群：${(config.blacklist?.groups ?? []).join(", ") || "无"} | 屏蔽用户：${(config.blacklist?.users ?? []).join(", ") || "无"}`,
+          };
+        }
+        default:
+          return { ok: false, detail: `未知操作 ${args.action}。` };
+      }
+    },
+    presentCall: (args) => ({
+      card: "generic",
+      title: "Friend mode",
+      kind: "other",
+      rawInput: args.action,
     }),
   }));
 }

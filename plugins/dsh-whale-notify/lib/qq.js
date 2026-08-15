@@ -80,6 +80,10 @@ export function startQQReceiver(config, onMessage, opts = {}) {
           userId: payload.user_id,
           groupId: msgType === "group" ? payload.group_id : undefined,
           text,
+          // 群友模式需要：是否 @ 机器人、是否回复引用、原始段
+          atMe: msgType === "group" && isAtMe(payload.message, payload.self_id),
+          isReply: msgType === "group" && hasReply(payload.message),
+          rawSegments: Array.isArray(payload.message) ? payload.message : [],
         });
       } catch (error) {
         log("解析消息失败:", error instanceof Error ? error.message : String(error));
@@ -88,6 +92,23 @@ export function startQQReceiver(config, onMessage, opts = {}) {
   });
 
   return () => wss.close();
+}
+
+/** Whether a group message contains an @mention of the bot itself. */
+function isAtMe(segments, selfId) {
+  if (!Array.isArray(segments)) return false;
+  return segments.some((seg) => {
+    if (seg.type !== "at") return false;
+    const qq = seg.data?.qq;
+    // OneBot: qq may be a number (self) or "all"
+    return qq !== "all" && String(qq) === String(selfId);
+  });
+}
+
+/** Whether a group message is a reply/quote of another message. */
+function hasReply(segments) {
+  if (!Array.isArray(segments)) return false;
+  return segments.some((seg) => seg.type === "reply");
 }
 
 /** Extract plain text from a OneBot message segment array (or string). */
