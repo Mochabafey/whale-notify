@@ -5,6 +5,7 @@ import { appendFile, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { sendEmail } from "./smtp.js";
 import { registerPending, pollAndInject, decisionTag } from "./ask.js";
+import { getTenantToken, sendText, startLongConnection, extractMessageEvent } from "./feishu.js";
 
 /** Append one JSONL record to $DSH_HOME/logs/notify.log (creates dir/file). */
 async function appendLog(record) {
@@ -42,8 +43,11 @@ const PARAMETERS = {
   },
   channel: {
     type: "string",
-    description: "要发送的渠道。不填时使用默认渠道；填 all 则发送到所有已配置的渠道。",
-    enum: ["all", "serverchan", "feishu", "wecom", "dingtalk", "smtp"],
+    description:
+      "要发送的渠道。可用渠道：feishu_bot（飞书开放平台，双向聊天，推荐）、serverchan（微信）、" +
+      "feishu（飞书群 webhook）、wecom（企业微信）、dingtalk（钉钉）、smtp（邮箱）。" +
+      "不填时使用默认渠道；填 all 则发送到所有已配置的渠道。未配置的渠道会被跳过。",
+    enum: ["all", "serverchan", "feishu", "feishu_bot", "wecom", "dingtalk", "smtp"],
   },
   level: {
     type: "string",
@@ -245,7 +249,7 @@ function expandEnv(value, env) {
  */
 function resolveChannel(config, channelName, env) {
   if (!config || typeof config !== "object") return undefined;
-  const entry = config[channelName];
+  const entry = channelName === "feishu_bot" ? config.feishuBot : config[channelName];
   if (!entry || typeof entry !== "object") return undefined;
   if (channelName === "smtp") {
     return resolveSmtp(entry, env);
@@ -253,6 +257,21 @@ function resolveChannel(config, channelName, env) {
   if (channelName === "serverchan") {
     const sendKey = expandEnv(entry.sendKey, env);
     return sendKey ? { sendKey, baseUrl: expandEnv(entry.baseUrl, env) } : undefined;
+  }
+  if (channelName === "feishu_bot") {
+    const appId = expandEnv(entry.appId, env);
+    const appSecret = expandEnv(entry.appSecret, env);
+    const receiveId = expandEnv(entry.receiveId, env);
+    if (!appId || !appSecret || !receiveId) {
+      return { error: "feishu_bot 未配置完整（需要 appId/appSecret/receiveId，均可用 $ENV: 引用）" };
+    }
+    return {
+      appId,
+      appSecret,
+      receiveId,
+      receiveIdType: entry.receiveIdType ?? "chat_id",
+      targetSession: expandEnv(entry.targetSession, env) || undefined,
+    };
   }
   const webhook = expandEnv(entry.webhook, env);
   if (!webhook) return undefined;
@@ -296,6 +315,14 @@ async function trySend(channel, config, title, message, env, reply) {
         await sendFeishu(entry.webhook, entry.secret, message);
         return { channel, ok: true, detail: "sent" };
       }
+      case "feishu_bot": {
+        if (!entry) throw new Error("飞书开放平台渠道未配置");
+        if (isConfigError(entry)) throw new Error(entry.error);
+        const token = await getTenantToken(entry.appId, entry.appSecret);
+        const text = reply ? `${title}\n\n${message}\n\n[决策编号 ${reply.id}] 回复本消息可直接给 agent 下达下一步指令。` : `${title}\n\n${message}`;
+        await sendText(token, entry.receiveId, entry.receiveIdType, text);
+        return { channel, ok: true, detail: "sent via open platform" };
+      }
       case "wecom": {
         if (!entry) throw new Error("企业微信渠道未配置（缺少 webhook）");
         await sendWecom(entry.webhook, message);
@@ -327,13 +354,13 @@ async function trySend(channel, config, title, message, env, reply) {
 /** Build the list of channels to send to for this call. */
 function targetChannels(channelArg, config, env) {
   const configured = [];
-  for (const candidate of ["serverchan", "feishu", "wecom", "dingtalk", "smtp"]) {
+  for (const candidate of ["serverchan", "feishu", "feishu_bot", "wecom", "dingtalk", "smtp"]) {
     if (resolveChannel(config, candidate, env) !== undefined) configured.push(candidate);
   }
   if (channelArg === "all") return configured;
   if (channelArg !== undefined) {
-    if (!["serverchan", "feishu", "wecom", "dingtalk", "smtp"].includes(channelArg)) {
-      throw new Error(`无效的渠道 ${JSON.stringify(channelArg)}（可选：all/serverchan/feishu/wecom/dingtalk/smtp）`);
+    if (!["serverchan", "feishu", "feishu_bot", "wecom", "dingtalk", "smtp"].includes(channelArg)) {
+      throw new Error(`无效的渠道 ${JSON.stringify(channelArg)}（可选：all/serverchan/feishu/feishu_bot/wecom/dingtalk/smtp）`);
     }
     return configured.includes(channelArg) ? [channelArg] : [];
   }
@@ -350,6 +377,13 @@ const Config = z.object({
   defaultChannel: z.string().default(""),
   serverchan: z.object({ sendKey: z.string(), baseUrl: z.string() }),
   feishu: z.object({ webhook: z.string(), secret: z.string() }),
+  feishuBot: z.object({
+    appId: z.string(),
+    appSecret: z.string(),
+    receiveId: z.string(),
+    receiveIdType: z.string(),
+    targetSession: z.string(),
+  }),
   wecom: z.object({ webhook: z.string() }),
   dingtalk: z.object({ webhook: z.string(), secret: z.string() }),
   smtp: z.object({
@@ -405,6 +439,7 @@ function apply(ctx, config) {
   const env = process.env;
   const imapConfig = resolveImap(resolved, env);
   const pollIntervalMs = resolved.pollIntervalMs ?? 60000;
+  const feishuBotConfig = resolveChannel(resolved, "feishu_bot", env);
 
   // 邮件回复轮询：有 imap 配置且有 pending 决策时才真正连接（间隔轮询）。
   // timer 已通过 inject 声明（host 层 dsh-base 提供），这里直接可用。
@@ -417,10 +452,53 @@ function apply(ctx, config) {
       }
     }, pollIntervalMs);
   }
+
+  // 飞书开放平台：长连接接收消息 → 注入目标 agent 会话。
+  // agents 是 host 层服务（可选依赖）；没有它时只保留发信能力。
+  if (feishuBotConfig && !isConfigError(feishuBotConfig)) {
+    const agents = ctx.get("agents");
+    if (agents && typeof agents.list === "function") {
+      let stopLongConnection = () => {};
+      startLongConnection(feishuBotConfig.appId, feishuBotConfig.appSecret, (payload) => {
+        const msg = extractMessageEvent(payload);
+        if (!msg) return;
+        // 只处理发往配置的目标会话（或用户发给机器人的私聊）
+        if (feishuBotConfig.receiveIdType === "chat_id" && msg.chatId !== feishuBotConfig.receiveId) return;
+        const text = `飞书消息（来自 ${msg.senderId ?? "用户"}）：${msg.text}`;
+        // 定位目标 agent：配置指定 sessionId，否则取注册表里第一个可用 agent。
+        let target = undefined;
+        const list = agents.list();
+        if (feishuBotConfig.targetSession) {
+          target = agents.get(feishuBotConfig.targetSession);
+        } else {
+          target = list[0];
+        }
+        if (target && typeof target.followup === "function") {
+          target.followup({
+            id: randomUUID(),
+            role: "user",
+            content: [{ type: "text", text }],
+            source: { kind: "user" },
+          });
+          appendLog({ ts: new Date().toISOString(), kind: "feishu_in", from: msg.senderId, text: msg.text }).catch(() => {});
+        }
+      }).then((stop) => {
+        stopLongConnection = stop;
+      }).catch((error) => {
+        console.error("[dsh-whale-notify] 飞书长连接启动失败:", error instanceof Error ? error.message : String(error));
+      });
+      // 插件停止时断开长连接
+      ctx.effect(() => stopLongConnection);
+    } else {
+      console.warn("[dsh-whale-notify] agents 服务不可用 — 飞书消息注入未启用（仅保留发信）");
+    }
+  }
   ctx.tools.register(defineTool({
     name: "notify",
     description:
-      "向用户发送一条通知消息（支持微信 Server酱、飞书、企业微信、钉钉、邮件）。" +
+      "向用户发送一条通知消息。渠道可选：feishu_bot（飞书开放平台，双向聊天，推荐）、" +
+      "serverchan（微信 Server酱）、feishu（飞书群 webhook）、wecom（企业微信）、" +
+      "dingtalk（钉钉）、smtp（邮件）。" +
       "当耗时任务完成、失败，或需要用户离开聊天也能注意到时使用。" +
       "传入标题和正文；可选指定 channel（渠道）或 'all'（全部渠道）。" +
       "未配置的渠道会被跳过。",
