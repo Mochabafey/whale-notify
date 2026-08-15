@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { sendEmail } from "./smtp.js";
 import { registerPending, pollAndInject, decisionTag } from "./ask.js";
 import { getTenantToken, sendText, startLongConnection, extractMessageEvent } from "./feishu.js";
+import { sendQQ, startQQReceiver } from "./qq.js";
 
 /** Append one JSONL record to $DSH_HOME/logs/notify.log (creates dir/file). */
 async function appendLog(record) {
@@ -44,10 +45,10 @@ const PARAMETERS = {
   channel: {
     type: "string",
     description:
-      "要发送的渠道。可用渠道：feishu_bot（飞书开放平台，双向聊天，推荐）、serverchan（微信）、" +
-      "feishu（飞书群 webhook）、wecom（企业微信）、dingtalk（钉钉）、smtp（邮箱）。" +
+      "要发送的渠道。可用渠道：feishu_bot（飞书开放平台，双向聊天，推荐）、qq（QQ，需 NapCat）、" +
+      "serverchan（微信）、feishu（飞书群 webhook）、wecom（企业微信）、dingtalk（钉钉）、smtp（邮箱）。" +
       "不填时使用默认渠道；填 all 则发送到所有已配置的渠道。未配置的渠道会被跳过。",
-    enum: ["all", "serverchan", "feishu", "feishu_bot", "wecom", "dingtalk", "smtp"],
+    enum: ["all", "serverchan", "feishu", "feishu_bot", "qq", "wecom", "dingtalk", "smtp"],
   },
   level: {
     type: "string",
@@ -273,6 +274,21 @@ function resolveChannel(config, channelName, env) {
       targetSession: expandEnv(entry.targetSession, env) || undefined,
     };
   }
+  if (channelName === "qq") {
+    const qq = expandEnv(entry.qq, env);
+    const groupId = expandEnv(entry.groupId, env);
+    if (!qq && !groupId) {
+      return { error: "qq 未配置完整（需要 qq 私聊号或 groupId 群号）" };
+    }
+    return {
+      httpBase: expandEnv(entry.httpBase, env) || undefined,
+      accessToken: expandEnv(entry.accessToken, env) || undefined,
+      qq,
+      groupId,
+      wsPort: entry.wsPort ?? 3001,
+      targetSession: expandEnv(entry.targetSession, env) || undefined,
+    };
+  }
   const webhook = expandEnv(entry.webhook, env);
   if (!webhook) return undefined;
   return { webhook, secret: expandEnv(entry.secret, env) };
@@ -323,6 +339,14 @@ async function trySend(channel, config, title, message, env, reply) {
         await sendText(token, entry.receiveId, entry.receiveIdType, text);
         return { channel, ok: true, detail: "sent via open platform" };
       }
+      case "qq": {
+        if (!entry) throw new Error("QQ 渠道未配置");
+        if (isConfigError(entry)) throw new Error(entry.error);
+        const target = entry.groupId ? { groupId: entry.groupId } : { qq: entry.qq };
+        const text = reply ? `${title}\n\n${message}\n\n[决策编号 ${reply.id}] 回复本消息可直接给 agent 下达下一步指令。` : `${title}\n\n${message}`;
+        await sendQQ(entry, target, text);
+        return { channel, ok: true, detail: entry.groupId ? `sent to group ${entry.groupId}` : `sent to ${entry.qq}` };
+      }
       case "wecom": {
         if (!entry) throw new Error("企业微信渠道未配置（缺少 webhook）");
         await sendWecom(entry.webhook, message);
@@ -354,12 +378,12 @@ async function trySend(channel, config, title, message, env, reply) {
 /** Build the list of channels to send to for this call. */
 function targetChannels(channelArg, config, env) {
   const configured = [];
-  for (const candidate of ["serverchan", "feishu", "feishu_bot", "wecom", "dingtalk", "smtp"]) {
+  for (const candidate of ["serverchan", "feishu", "feishu_bot", "qq", "wecom", "dingtalk", "smtp"]) {
     if (resolveChannel(config, candidate, env) !== undefined) configured.push(candidate);
   }
   if (channelArg === "all") return configured;
   if (channelArg !== undefined) {
-    if (!["serverchan", "feishu", "feishu_bot", "wecom", "dingtalk", "smtp"].includes(channelArg)) {
+    if (!["serverchan", "feishu", "feishu_bot", "qq", "wecom", "dingtalk", "smtp"].includes(channelArg)) {
       throw new Error(`无效的渠道 ${JSON.stringify(channelArg)}（可选：all/serverchan/feishu/feishu_bot/wecom/dingtalk/smtp）`);
     }
     return configured.includes(channelArg) ? [channelArg] : [];
@@ -386,6 +410,14 @@ const Config = z.object({
   }),
   wecom: z.object({ webhook: z.string() }),
   dingtalk: z.object({ webhook: z.string(), secret: z.string() }),
+  qq: z.object({
+    httpBase: z.string(),
+    accessToken: z.string(),
+    qq: z.string(),            // 私聊目标 QQ 号
+    groupId: z.string(),       // 群聊目标群号（可选）
+    wsPort: z.number(),        // 接收端反向 WS 端口
+    targetSession: z.string(), // 可选：QQ 消息注入哪个 DSH 会话
+  }),
   smtp: z.object({
     host: z.string(),
     port: z.number(),
@@ -408,6 +440,14 @@ const Config = z.object({
     rejectUnauthorized: z.boolean(),
   }),
   pollIntervalMs: z.number(),
+  // 定时汇报：{ name, channel, schedule, text } 数组。
+  // schedule 格式："daily:HH:MM"（每日定点）或 "every:N"（每 N 分钟，N>=5）。
+  reports: z.array(z.object({
+    name: z.string(),
+    channel: z.string(),
+    schedule: z.string(),
+    text: z.string(),
+  })),
 });
 
 /** Resolve the IMAP config (same $ENV: expansion as SMTP). */
@@ -440,6 +480,23 @@ function apply(ctx, config) {
   const imapConfig = resolveImap(resolved, env);
   const pollIntervalMs = resolved.pollIntervalMs ?? 60000;
   const feishuBotConfig = resolveChannel(resolved, "feishu_bot", env);
+  const qqConfig = resolveChannel(resolved, "qq", env);
+
+  /** 注入一条用户消息到目标 agent（配置指定 session 或注册表第一个）。 */
+  const injectToAgent = (agents, targetSession, text, logKind, from) => {
+    if (!agents || typeof agents.list !== "function") return;
+    const list = agents.list();
+    let target = targetSession ? agents.get(targetSession) : list[0];
+    if (target && typeof target.followup === "function") {
+      target.followup({
+        id: randomUUID(),
+        role: "user",
+        content: [{ type: "text", text }],
+        source: { kind: "user" },
+      });
+      appendLog({ ts: new Date().toISOString(), kind: logKind, from, text }).catch(() => {});
+    }
+  };
 
   // 邮件回复轮询：有 imap 配置且有 pending 决策时才真正连接（间隔轮询）。
   // timer 已通过 inject 声明（host 层 dsh-base 提供），这里直接可用。
@@ -464,24 +521,7 @@ function apply(ctx, config) {
         if (!msg) return;
         // 只处理发往配置的目标会话（或用户发给机器人的私聊）
         if (feishuBotConfig.receiveIdType === "chat_id" && msg.chatId !== feishuBotConfig.receiveId) return;
-        const text = `飞书消息（来自 ${msg.senderId ?? "用户"}）：${msg.text}`;
-        // 定位目标 agent：配置指定 sessionId，否则取注册表里第一个可用 agent。
-        let target = undefined;
-        const list = agents.list();
-        if (feishuBotConfig.targetSession) {
-          target = agents.get(feishuBotConfig.targetSession);
-        } else {
-          target = list[0];
-        }
-        if (target && typeof target.followup === "function") {
-          target.followup({
-            id: randomUUID(),
-            role: "user",
-            content: [{ type: "text", text }],
-            source: { kind: "user" },
-          });
-          appendLog({ ts: new Date().toISOString(), kind: "feishu_in", from: msg.senderId, text: msg.text }).catch(() => {});
-        }
+        injectToAgent(agents, feishuBotConfig.targetSession, `飞书消息（来自 ${msg.senderId ?? "用户"}）：${msg.text}`, "feishu_in", msg.senderId);
       }).then((stop) => {
         stopLongConnection = stop;
       }).catch((error) => {
@@ -492,6 +532,53 @@ function apply(ctx, config) {
     } else {
       console.warn("[dsh-whale-notify] agents 服务不可用 — 飞书消息注入未启用（仅保留发信）");
     }
+  }
+
+  // QQ（OneBot/NapCat）：接收 QQ 消息 → 注入目标 agent 会话。
+  if (qqConfig && !isConfigError(qqConfig)) {
+    const agents = ctx.get("agents");
+    try {
+      const stopQQ = startQQReceiver(qqConfig, (msg) => {
+        const label = msg.type === "group" ? `群 ${msg.groupId}` : `QQ ${msg.userId}`;
+        injectToAgent(agents, qqConfig.targetSession, `QQ 消息（来自 ${label}）：${msg.text}`, "qq_in", msg.userId);
+      });
+      ctx.effect(() => stopQQ);
+    } catch (error) {
+      console.error("[dsh-whale-notify] QQ 接收端启动失败:", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  // 定时汇报：到点通过 notify 推送到配置的渠道（飞书/QQ/邮件等）。
+  // reports: [{ name, channel, schedule: "daily:09:00" | "every:<min>", text }]
+  const reports = Array.isArray(resolved.reports) ? resolved.reports : [];
+  if (reports.length > 0 && typeof ctx.interval === "function") {
+    const fire = (report) => {
+      // 用 notify 的发送链路（复用 trySend 逻辑，无需 agent）
+      trySend(report.channel, resolved, `【定时汇报】${report.name}`, report.text, env)
+        .then((result) => {
+          appendLog({ ts: new Date().toISOString(), kind: "report", name: report.name, result }).catch(() => {});
+        })
+        .catch((error) => console.error("[dsh-whale-notify] 定时汇报失败:", error instanceof Error ? error.message : String(error)));
+    };
+    const isDue = (report) => {
+      const now = new Date();
+      const spec = String(report.schedule ?? "");
+      if (/^daily:(\d{2}):(\d{2})$/.test(spec)) {
+        const [, hh, mm] = /^daily:(\d{2}):(\d{2})$/.exec(spec);
+        return now.getHours() === Number(hh) && now.getMinutes() === Number(mm);
+      }
+      if (/^every:(\d+)$/.test(spec)) {
+        const minutes = Number(/^every:(\d+)$/.exec(spec)[1]);
+        return now.getMinutes() % minutes === 0 && now.getSeconds() < 30;
+      }
+      return false;
+    };
+    // 每 30 秒检查一次到点汇报（timer 已注入）
+    ctx.interval(() => {
+      for (const report of reports) {
+        if (isDue(report)) fire(report);
+      }
+    }, 30000);
   }
   ctx.tools.register(defineTool({
     name: "notify",

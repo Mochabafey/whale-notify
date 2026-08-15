@@ -1,6 +1,6 @@
-# 🐋 Whale Notify（鲸鱼通知）—— DeepSeek Harness 通知、邮件问答与飞书机器人插件
+# 🐋 Whale Notify（鲸鱼通知）—— DeepSeek Harness 通知、聊天机器人与定时汇报插件
 
-给 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 的 agent 注入鲸鱼娘的灵魂：一个 **鲸鱼娘人设**，和一个**能发通知、能收回复、能听你指挥**的插件——支持**飞书开放平台双向聊天**、邮件问答、多渠道通知。
+给 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness) 的 agent 注入鲸鱼娘的灵魂：一个 **鲸鱼娘人设**，和一个**能发通知、能收回复、能听你指挥**的插件——支持**飞书/QQ 双向聊天**、邮件问答、定时汇报、多渠道通知。
 
 > 人设灵感来自 [萌娘百科·DeepSeek娘](https://zh.moegirl.org.cn/DeepSeek%E5%A8%98)（白发蓝瞳、鲸鱼尾巴、傲娇天才）。
 
@@ -8,8 +8,10 @@
 
 | 插件 | 工具/能力 | 说明 |
 | --- | --- | --- |
-| **dsh-whale-notify**（鲸鱼通知） | `notify` | 任务完成/失败通知 → 飞书开放平台、微信（Server酱）、飞书 webhook、企业微信、钉钉、邮箱 |
+| **dsh-whale-notify**（鲸鱼通知） | `notify` | 任务完成/失败通知 → 飞书开放平台、QQ（NapCat）、微信（Server酱）、飞书 webhook、企业微信、钉钉、邮箱 |
 | | **飞书双向聊天** | 你在飞书里给机器人发消息 → 注入 DSH 会话 → agent 执行；任务结果可推回飞书 |
+| | **QQ 双向聊天** | 通过 NapCat（OneBot）收发 QQ 消息，注入 DSH 会话 |
+| | **定时汇报** | 每日定点/定期推送状态到飞书或 QQ（`daily:HH:MM` / `every:N`） |
 | | `notify(awaitReply:true)` | 邮件通知**可回复指挥**：回复邮件即可给 agent 下达下一步指令 |
 | | `ask_user_email` | agent 通过邮件提问/审批，你回复后答案**自动注入会话** |
 | **鲸鱼娘 persona** | — | 傲娇天才 AI 人设（附完整工作准则，先干活再卖萌） |
@@ -25,8 +27,9 @@ whale-notify/
 │   └── dsh-whale-notify/              # 鲸鱼通知插件（包名 dsh-whale-notify）
 │       ├── package.json
 │       └── lib/
-│           ├── index.js               # 插件主体：notify / ask_user_email + 飞书注入
+│           ├── index.js               # 插件主体：notify / ask_user_email + 消息注入 + 定时汇报
 │           ├── feishu.js              # 飞书开放平台：token/发消息/长连接接收（官方 SDK）
+│           ├── qq.js                  # QQ（OneBot/NapCat）：发送 + 反向 WS 接收
 │           ├── smtp.js                # 手写 SMTP 客户端（零依赖）
 │           ├── imap.js                # IMAP 轮询 + 邮件解析
 │           └── ask.js                 # 决策状态管理 + 回复注入
@@ -125,6 +128,43 @@ $DSH_HOME\profiles\node_modules\
 > 💡 长连接由官方 `@larksuiteoapi/node-sdk` 处理（token 刷新、protobuf 解码、自动重连）。
 > 自建应用的 App Secret 是敏感凭证，泄露后请到后台重置。
 
+#### 💬 QQ（OneBot / NapCat）—— 双向聊天
+
+**前提**：本机运行 [NapCat](https://github.com/NapNeko/NapCatQQ)（登录一个 QQ 号），HTTP API 默认 `http://127.0.0.1:3000`。
+
+**配置**：
+
+```yaml
+    qq:
+      httpBase: 'http://127.0.0.1:3000'   # OneBot HTTP API
+      accessToken: ''                     # OneBot 访问令牌（可选）
+      qq: '123456789'                         # 私聊目标 QQ 号
+      groupId: ''                         # 或填群号（二选一，优先群）
+      wsPort: 3001                        # 本插件监听反向 WS 的端口
+      targetSession: ''                   # 可选：QQ 消息注入哪个 DSH 会话
+```
+
+> 💡 反向 WS：在 NapCat 的 OneBot 配置里添加「反向 WebSocket」指向 `ws://127.0.0.1:3001`，
+> 插件即能接收 QQ 消息并注入会话。
+
+#### 📅 定时汇报
+
+**配置**（`reports` 数组，可多条）：
+
+```yaml
+    reports:
+      - name: '每日晨报'                  # 汇报名称（作为通知标题）
+        channel: 'feishu_bot'             # 推送渠道（已配置的：feishu_bot / smtp / qq 等）
+        schedule: 'daily:09:00'           # daily:HH:MM 每日定点；或 every:N 每 N 分钟（N>=5）
+        text: '🐋 鲸鱼娘每日晨报：新的一天开始了！'
+```
+
+**schedule 格式**：
+- `daily:09:00` — 每天 09:00 推送
+- `every:30` — 每 30 分钟推送
+
+> 内容当前为静态文本模板（如含会话数/任务数等动态信息的日报需要 agent 驱动，属后续增强）。
+
 #### 💬 飞书群机器人（webhook）—— 只发通知，最简接入
 
 1. 飞书群 → 设置 → 群机器人 → 添加机器人 → **自定义机器人**
@@ -167,12 +207,14 @@ $DSH_HOME\profiles\node_modules\
 > | 渠道 | 发通知 | 回复指挥 | 说明 |
 > | --- | --- | --- | --- |
 > | **飞书开放平台**（自建应用） | ✅ | ✅（飞书里直接回复） | 双向聊天，实时注入会话 |
+> | **QQ（NapCat / OneBot）** | ✅ | ✅（QQ 里直接回复） | 双向聊天，实时注入会话 |
 > | 邮箱 SMTP/IMAP | ✅ | ✅（回复邮件） | 全功能 |
 > | 飞书 webhook | ✅ | ❌（单向） | 最简单，只发不收 |
 > | 微信 Server酱 | ✅ | ❌（单向） | |
 > | 企业微信 | ✅ | ❌（单向） | |
 > | 钉钉 | ✅ | ❌（单向） | |
-> | QQ（NapCat，规划中） | — | — | 后续版本接入 OneBot |
+>
+> 另有 **定时汇报**（`reports`）：每日定点/定期推送到任一已配置渠道。
 
 ### 4. 设置密钥环境变量
 
