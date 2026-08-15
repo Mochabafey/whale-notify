@@ -60,16 +60,97 @@ $DSH_HOME\profiles\node_modules\
 参考 `examples/agent.cordis.whale.yml`，把内容合并进你的 agent preset 的 `agent.cordis.yml`
 （用户 preset 位于 `$DSH_HOME\.agent-presets\<你的预设>\`，或新建一个）。
 
-### 3. 设置密钥环境变量
+### 3. 配置渠道
+
+编辑 preset 的 `agent.cordis.yml`，在 `tool-notify` 的 `config` 下按需启用渠道
+（完整示例见 `examples/agent.cordis.whale.yml`）。密钥一律用 `$ENV:变量名` 引用。
+
+#### 📧 邮箱（SMTP + IMAP）—— 支持通知、邮件问答、回复指挥
+
+```yaml
+    smtp:
+      host: 'smtp.feishu.cn'          # 你的邮箱发信服务器
+      port: 587                       # 587=STARTTLS；465=隐式SSL(secure:true)
+      secure: false
+      user: 'your-mailbox@example.com'
+      pass: '$ENV:MAIL_PASS'          # 邮箱专用密码/授权码
+      from: 'your-mailbox@example.com'
+      to: ['you@example.com']         # 收件人
+    imap:
+      host: 'imap.feishu.cn'          # 收信服务器（ask_user_email 用）
+      port: 993
+      secure: true
+      user: 'your-mailbox@example.com'
+      pass: '$ENV:MAIL_PASS'          # 同一个授权码
+      mailbox: 'INBOX'
+    pollIntervalMs: 30000             # 轮询间隔（毫秒）
+```
+
+> ⚠️ 各邮箱的授权码互不通用：飞书用「专用密码」、QQ 用「授权码」、163 用「客户端授权码」、
+> Gmail 用「应用专用密码」。每个邮箱单独开启 SMTP/IMAP 服务后各拿各的码。
+
+#### 💬 飞书群机器人（webhook）—— 只发通知，最简接入
+
+1. 飞书群 → 设置 → 群机器人 → 添加机器人 → **自定义机器人**
+2. 复制 Webhook 地址；若创建时选「签名校验」，记下签名密钥
+3. 配置：
+
+```yaml
+    feishu:
+      webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx'
+      secret: '$ENV:FEISHU_BOT_SECRET'   # 可选：签名校验密钥
+```
+
+#### 💬 微信（Server酱）—— 微信推送通知
+
+1. 微信扫码登录 https://sct.ftqq.com 拿 SendKey
+2. 配置：
+
+```yaml
+    serverchan:
+      sendKey: '$ENV:SERVERCHAN_SEND_KEY'
+```
+
+#### 💬 企业微信群机器人
+
+```yaml
+    wecom:
+      webhook: '$ENV:WECOM_WEBHOOK'
+```
+
+#### 💬 钉钉群机器人
+
+```yaml
+    dingtalk:
+      webhook: '$ENV:DINGTALK_WEBHOOK'
+      secret: '$ENV:DINGTALK_SECRET'   # 可选：加签密钥
+```
+
+> 📝 **渠道能力一览**：
+>
+> | 渠道 | 发通知 | 回复指挥 | 说明 |
+> | --- | --- | --- | --- |
+> | 邮箱 SMTP/IMAP | ✅ | ✅（回复邮件） | 全功能 |
+> | 飞书 webhook | ✅ | ❌（单向） | 最简单，只发不收 |
+> | 微信 Server酱 | ✅ | ❌（单向） | |
+> | 企业微信 | ✅ | ❌（单向） | |
+> | 钉钉 | ✅ | ❌（单向） | |
+> | QQ（NapCat，规划中） | — | — | 后续版本接入 OneBot |
+
+### 4. 设置密钥环境变量
 
 ```powershell
-[Environment]::SetEnvironmentVariable("FEISHU_SMTP_PASS", "你的专用密码", "User")
+# 邮箱授权码（发/收信共用）
+[Environment]::SetEnvironmentVariable("MAIL_PASS", "你的专用密码", "User")
+# 飞书机器人签名密钥（如果创建时加了签）
+[Environment]::SetEnvironmentVariable("FEISHU_BOT_SECRET", "你的密钥", "User")
+# 微信 SendKey
+[Environment]::SetEnvironmentVariable("SERVERCHAN_SEND_KEY", "你的SendKey", "User")
 ```
 
 重启 DSH 后生效。**密钥永远不会写进任何配置文件**。
 
 ## 📧 邮件回复指挥 & 问答（核心玩法）
-
 ### 通知可回复指挥
 agent 调用 `notify(awaitReply: true)` 发出完成通知邮件 → 邮件主题带 `[DSH:编号]`，
 正文提示「回复此邮件可直接给 agent 下达下一步指令」→ 你回复邮件写下新指令 →
@@ -90,8 +171,11 @@ agent 调用 `ask_user_email(question, context?, options?)` → 发询问邮件 
 ## 🧪 自测
 
 ```sh
-node verify-notify.mjs    # 启动 mock HTTP + TLS SMTP 服务器，验证 5 渠道与 SMTP 全流程
+node verify-notify.mjs    # mock HTTP + TLS SMTP 服务器，验证 5 个发送渠道 + SMTP 全流程（14 项检查）
 ```
+
+> 需要系统 `openssl`（生成一次性测试证书；Git for Windows 自带）。若插件未安装到 DSH，可设置
+> `DSH_HOME` 环境变量指向你的 DSH 用户目录后再运行。
 
 ## 📄 许可
 
