@@ -11,7 +11,9 @@
 | **dsh-whale-notify**（鲸鱼通知） | `notify` | 任务完成/失败通知 → 飞书开放平台、QQ（NapCat）、微信（Server酱）、飞书 webhook、企业微信、钉钉、邮箱 |
 | | **飞书双向聊天** | 你在飞书里给机器人发消息 → 注入 DSH 会话 → agent 执行；任务结果可推回飞书 |
 | | **QQ 双向聊天** | 通过 NapCat（OneBot）收发 QQ 消息，注入 DSH 会话 |
-| | **定时汇报** | 每日定点/定期推送状态到飞书或 QQ（`daily:HH:MM` / `every:N`） |
+| | **定时汇报** | 每日定点/定期推送状态到飞书或 QQ（`daily:HH:MM` / `every:N`，`enableReports` 开关） |
+| | **记忆模式** | 新会话可恢复历史会话记忆（`recall_memory`，AI 主动询问） |
+| | **学习模式** | 学会新技能询问用户 → `learn_skill` 存知识库 → `recall_skill` 调取 |
 | | `notify(awaitReply:true)` | 邮件通知**可回复指挥**：回复邮件即可给 agent 下达下一步指令 |
 | | `ask_user_email` | agent 通过邮件提问/审批，你回复后答案**自动注入会话** |
 | **鲸鱼娘 persona** | — | 傲娇天才 AI 人设（附完整工作准则，先干活再卖萌） |
@@ -27,9 +29,10 @@ whale-notify/
 │   └── dsh-whale-notify/              # 鲸鱼通知插件（包名 dsh-whale-notify）
 │       ├── package.json
 │       └── lib/
-│           ├── index.js               # 插件主体：notify / ask_user_email + 消息注入 + 定时汇报
+│           ├── index.js               # 插件主体：工具 + 消息注入 + 定时汇报
 │           ├── feishu.js              # 飞书开放平台：token/发消息/长连接接收（官方 SDK）
 │           ├── qq.js                  # QQ（OneBot/NapCat）：发送 + 反向 WS 接收
+│           ├── knowledge.js           # 学习模式知识库（markdown 持久保存）
 │           ├── smtp.js                # 手写 SMTP 客户端（零依赖）
 │           ├── imap.js                # IMAP 轮询 + 邮件解析
 │           └── ask.js                 # 决策状态管理 + 回复注入
@@ -245,6 +248,38 @@ agent 把消息当作你的指令执行 → 结果可通过 `notify(channel: "fe
                                               │
 你 ◀──通知/结果──── notify(feishu_bot) ◀──────┘
 ```
+
+## 🧠 记忆模式（跨会话恢复）
+
+上下文满了或新开会话时，可以恢复之前的工作记忆：
+
+1. 新会话开始，agent 会主动询问：「是否要恢复之前的记忆？」
+2. 你同意后，agent 用 `recall_memory` 按关键词搜索历史会话（如「股市复盘」）
+3. 找到候选会话 → 注入其关键对话内容 → agent 延续之前的工作
+
+```text
+你：「恢复昨天股市复盘的记忆」
+agent：调用 recall_memory(query: "股市复盘") → 注入历史内容 → 继续工作
+```
+
+> 依赖 host 的 `sessionQuery` 服务（web 组合已内置），无需额外配置。
+
+## 🎓 学习模式（技能知识库）
+
+鲸鱼娘在对话中学到新技能/经验时，会**先询问你是否记录**，确认后存进知识库：
+
+1. 用户教了新方法，或鲸鱼娘摸索出新用法 → 询问「要不要记到知识库？」
+2. 你同意 → `learn_skill(title, content, tags?)` 保存为 markdown
+3. 之后需要时 → `recall_skill(query)` 搜索调取
+
+```text
+你：「把飞书发消息的步骤记下来」
+agent：learn_skill("飞书发消息", "步骤…", ["飞书", "通知"])
+你（以后）：「上次飞书通知是怎么配的？」
+agent：recall_skill("飞书") → 返回记录内容
+```
+
+知识库位置：`$DSH_HOME\knowledge\`（默认 `~/.dsh/knowledge`），markdown 文档持久保存。
 
 ## 📧 邮件回复指挥 & 问答（核心玩法）
 ### 通知可回复指挥
