@@ -77,6 +77,12 @@ const PARAMETERS = {
       "设为 true 时，邮件通知会附带决策编号，你直接回复该邮件即可给 agent 下达下一步指令，" +
       "回复内容会自动注入回当前会话。仅对邮件渠道生效；要求配置了 imap。",
   },
+  groupId: {
+    type: "string",
+    description:
+      "仅 QQ 渠道用：要发往的群号。群友模式回复时填上被 @ 的那个群号即可把回复发回群里；" +
+      "不填则用配置里的默认 groupId，都没有则发私聊。",
+  },
 };
 
 /** Schema of the `ask_user_email` tool's parameters. */
@@ -333,7 +339,7 @@ function formatTitle(title, level) {
  * @param reply - optional { id, hint } — when set, the SMTP subject carries
  *   the decision tag and the body gains a "reply to command" hint.
  */
-async function trySend(channel, config, title, message, env, reply) {
+async function trySend(channel, config, title, message, env, reply, extra) {
   const entry = resolveChannel(config, channel, env);
   try {
     switch (channel) {
@@ -358,10 +364,12 @@ async function trySend(channel, config, title, message, env, reply) {
       case "qq": {
         if (!entry) throw new Error("QQ 渠道未配置");
         if (isConfigError(entry)) throw new Error(entry.error);
-        const target = entry.groupId ? { groupId: entry.groupId } : { qq: entry.qq };
+        // 优先用调用时指定的群号（群友模式回原群），否则用配置的 groupId/qq
+        const groupId = extra?.groupId ?? entry.groupId;
+        const target = groupId ? { groupId } : { qq: entry.qq };
         const text = reply ? `${title}\n\n${message}\n\n[决策编号 ${reply.id}] 回复本消息可直接给 agent 下达下一步指令。` : `${title}\n\n${message}`;
         await sendQQ(entry, target, text);
-        return { channel, ok: true, detail: entry.groupId ? `sent to group ${entry.groupId}` : `sent to ${entry.qq}` };
+        return { channel, ok: true, detail: groupId ? `sent to group ${groupId}` : `sent to ${entry.qq}` };
       }
       case "wecom": {
         if (!entry) throw new Error("企业微信渠道未配置（缺少 webhook）");
@@ -745,7 +753,7 @@ function apply(ctx, config) {
       }
       const delivered = [];
       for (const channel of channels) {
-        delivered.push(await trySend(channel, resolved, title, args.message, process.env, reply));
+        delivered.push(await trySend(channel, resolved, title, args.message, process.env, reply, { groupId: args.groupId }));
       }
       const failed = delivered.filter((d) => !d.ok);
       // 发送日志：追加 JSONL 到 $DSH_HOME/logs/notify.log（失败静默降级，不影响通知）。
