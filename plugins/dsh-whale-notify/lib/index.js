@@ -601,7 +601,7 @@ function apply(ctx, config) {
           appendLog({ ts: new Date().toISOString(), kind: "feishu_denied", from: msg.senderId, text: msg.text }).catch(() => {});
           return;
         }
-        injectToAgent(agents, feishuBotConfig.targetSession, `飞书消息（来自 ${msg.senderId ?? "用户"}）：${msg.text}`, "feishu_in", msg.senderId, { readOnly: ac.readOnly });
+        injectToAgent(agents, feishuBotConfig.targetSession, `飞书消息（来自 ${msg.senderId ?? "用户"}）：${msg.text}\n\n（本条指令来自飞书渠道——任务完成后请通过 notify(channel: "feishu_bot") 把结果发回飞书，让用户知道。）`, "feishu_in", msg.senderId, { readOnly: ac.readOnly });
       }).then((stop) => {
         stopLongConnection = stop;
       }).catch((error) => {
@@ -651,10 +651,10 @@ function apply(ctx, config) {
             // 命中触发：注入会话，带群友提示词
             buildFriendPrompt(fm).then((prompt) => {
               injectToAgent(agents, qqConfig.targetSession,
-                `【群友模式·群 ${msg.groupId}】来自 ${msg.userId}：${msg.text}\n\n${prompt}`,
+                `【群友模式·群 ${msg.groupId}】来自 ${msg.userId}：${msg.text}\n\n（回复请通过 notify(channel: "qq", groupId: "${msg.groupId}") 发回这个群。）\n\n${prompt}`,
                 "friend_in", msg.userId, { readOnly: fm.readOnly });
             }).catch(() => {
-              injectToAgent(agents, qqConfig.targetSession, `【群友模式·群 ${msg.groupId}】来自 ${msg.userId}：${msg.text}`, "friend_in", msg.userId);
+              injectToAgent(agents, qqConfig.targetSession, `【群友模式·群 ${msg.groupId}】来自 ${msg.userId}：${msg.text}\n\n（回复请通过 notify(channel: "qq", groupId: "${msg.groupId}") 发回这个群。）`, "friend_in", msg.userId);
             });
           }).catch(() => {});
           return;
@@ -665,7 +665,7 @@ function apply(ctx, config) {
           appendLog({ ts: new Date().toISOString(), kind: "qq_denied", from: msg.userId, text: msg.text }).catch(() => {});
           return;
         }
-        injectToAgent(agents, qqConfig.targetSession, `QQ 消息（来自 ${label}）：${msg.text}`, "qq_in", msg.userId, { readOnly: ac.readOnly });
+        injectToAgent(agents, qqConfig.targetSession, `QQ 消息（来自 ${label}）：${msg.text}\n\n（本条指令来自 QQ 渠道——任务完成后请通过 notify(channel: "qq") 把结果发回该 QQ，让用户知道。）`, "qq_in", msg.userId, { readOnly: ac.readOnly });
       });
       ctx.effect(() => stopQQ);
     } catch (error) {
