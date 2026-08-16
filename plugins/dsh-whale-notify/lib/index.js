@@ -542,11 +542,22 @@ function apply(ctx, config) {
     return { allowed: false, readOnly: false };
   };
 
-  /** 注入一条用户消息到目标 agent（配置指定 session 或注册表第一个）。 */
+  /** 注入一条用户消息到目标 agent（配置指定 session，否则自动选最近活跃会话）。 */
   const injectToAgent = (agents, targetSession, text, logKind, from, opts = {}) => {
     if (!agents || typeof agents.list !== "function") return;
     const list = agents.list();
-    let target = targetSession ? agents.get(targetSession) : list[0];
+    let target = targetSession ? agents.get(targetSession) : undefined;
+    if (!target) {
+      // 自动选最近活跃会话：按 session 最后事件时间排序，取最新的
+      const withTime = list
+        .map((a) => {
+          const events = a?.session?.events;
+          const last = events && events.length > 0 ? events[events.length - 1] : undefined;
+          return { agent: a, time: last?.time ?? 0 };
+        })
+        .sort((x, y) => y.time - x.time);
+      target = withTime[0]?.agent;
+    }
     if (target && typeof target.followup === "function") {
       const finalText = opts.readOnly
         ? `[只读消息] ${text}\n\n（此消息来自只读用户，仅作参考，不要执行任何修改性操作。）`
