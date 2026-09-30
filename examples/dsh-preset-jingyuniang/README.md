@@ -70,6 +70,29 @@ resume failed for session "session-…": RemoteError: Unknown agent preset: <id>
 header 存的就是这个名字。沿用旧 id，这些会话才能在新客户端里继续打开——把 id 改成
 `jingyuniang` 之类的名字，代价就是这 21 个会话全部打不开。
 
+### 万一已经改错了 id：怎么救回来
+
+会话的 preset 标识存在**两个地方**，改错 id 后两处都要迁回来，否则照样报
+`Unknown agent preset`：
+
+1. **会话文件里的 `agent-preset/selected` 事件**——
+   `$DSH_HOME/sessions/**/session[.v3|.v4].jsonl.zstd`（zstd 分帧，要**逐帧**解压改写再重压，
+   帧边界和行数必须保持不变）；
+2. **客户端侧的投影缓存**——
+   `$DSH_HOME/storages/session_projcache/sessions/<session-id>.json` 里的
+   `record.rows.agentPreset.val`。
+
+工作区脚本就是干这个的（默认 dry-run，`--apply` 才写盘，写前自动留 `.bak-jingyuniang`）：
+
+```powershell
+node C:\Users\Master\Documents\Deepseek\_whale-diag\_fix_jingyuniang.cjs          # 先看会改哪些
+node C:\Users\Master\Documents\Deepseek\_whale-diag\_fix_jingyuniang.cjs --apply  # 执行
+node C:\Users\Master\Documents\Deepseek\_whale-diag\_verify_jingyuniang_fix.cjs   # 校验（帧数/行数不变、只有那一处值变化）
+```
+
+改完重启客户端。**注意**：只改 header 是没用的——恢复会话时用的是
+`agent-preset/selected` 投影，不是 header 里那个初始值。
+
 ## 让新会话默认用鲸鱼娘
 
 0.2.0 里 `settings.yaml` 的 `agent-presets.default` **已经不存在了**。默认 preset 由

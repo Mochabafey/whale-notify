@@ -61,6 +61,15 @@ whale-notify/
 > preset 不再是 `$DSH_HOME\.agent-presets\` 目录，而是 **profile 组合里的声明行**；
 > 插件也不再靠往 profile 的 `node_modules` 里拷目录来装，而是作为 **profile bundle** 安装。
 > 0.1.5 及更早的装法见文末「旧版本（DSH ≤ 0.1.5）」。
+>
+> 🧱 **0.2.0 的插件兼容闸门**：`dsh-app-boot` 会拿插件 `package.json` 里的
+> `@deepseek-ai/dsh-*` peerDependencies 去比运行时版本，**对不上就整个插件不加载**
+> （不是降级、也不只是警告）。所以第三方插件必须升到声明了 0.2.x 的版本——
+> 本机实测：`dsh-ssh-ops` 要 ≥ **0.3.14**（旧 0.3.12 声明 `^0.1.6-alpha.1`，被拦），
+> `dshmarket` 要 ≥ **1.66.6**（旧 1.47.0 声明 `^0.1.2-alpha.2`，被拦）。
+> 确实没有适配版时，才在 `$DSH_HOME/profiles/<profile>/compatibility.json` 里按
+> `{"包名@精确版本": ["精确的 DSH 版本"]}` 授予豁免（官方途径 `dsh plugin allow-version`）。
+> 本仓库的插件**不声明 dsh peers**，因此不受这道闸门影响。
 
 ### 1. 作为 profile bundle 安装（0.2.x 推荐）
 
