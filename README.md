@@ -100,6 +100,12 @@ pnpm install          # 用 DSH 客户端自带的 pnpm
 `examples/dsh-preset-jingyuniang/` 是一个预设 bundle：鲸鱼娘人设 + 标准模式全部能力。
 按它的 README 装成 bundle 后，模式选择器里就会出现「鲸鱼娘」。
 
+> ⚠️ 它的 `config.id` 是 **`standard-units`**（0.1.5 时代 preset 目录名），**不要改**：
+> 会话 header 里存的就是这个 id，改了会让历史会话报
+> `RemoteError: Unknown agent preset`。想让**新会话默认**用它，要在 profile 的
+> `cordis.patch.yml` 里覆盖 `agent-preset-registry` 的 `config.default: standard-units`
+> （0.2.0 已不再读 `settings.yaml` 里的 `agent-presets.default`）。
+
 ### 3. 配置外部服务
 
 按 [📖 外部服务配置指南](docs/外部服务配置.md) 申请/配置：

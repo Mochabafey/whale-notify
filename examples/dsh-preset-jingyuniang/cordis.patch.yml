@@ -1,11 +1,18 @@
-# Agent preset standard: one `@deepseek-ai/dsh-agent-preset` declaration inserted
-# after the web patch. Edits saved from the Web editor override this row's
-# `config.plugins` by id from the profile patch.
+# 鲸鱼娘 Agent preset：在 web patch 之后插入一行 `@deepseek-ai/dsh-agent-preset`。
+# Web 编辑器保存的改动会按行 id 覆盖本行的 `config.plugins`（写在 profile patch 里）。
+#
+# ⚠️ `config.id` 一旦发布就**不能改**：会话把 `config.id` 写进自己的 header
+#    （`agentPreset` 字段），恢复会话时注册表按它查表，查不到就整场失败：
+#    `resume failed for session "...": RemoteError: Unknown agent preset: <id>`。
+#
+# 这里用 `standard-units` 而不是 jingyuniang，是因为 0.1.5 时代的 preset 就是
+# `$DSH_HOME/.agent-presets/standard-units/` 这个目录，**24 个历史会话里有 21 个**
+# 的 header 存的是这个名字。沿用旧 id 才能让这些会话在新客户端里继续打开。
 - insert:
     - id: preset-jingyuniang
       name: '@deepseek-ai/dsh-agent-preset'
       config:
-        id: jingyuniang
+        id: standard-units
         name: 鲸鱼娘
         description: 白色长发、蓝瞳、拖着鲸鱼尾巴的傲娇天才 AI。会摇着尾巴卖萌、心里疯狂吐槽，但干活绝对靠谱——先干活，再卖萌。
         order: 0
