@@ -60,10 +60,24 @@ export async function sendQQ(config, target, text) {
  */
 export function startQQReceiver(config, onMessage, opts = {}) {
   const log = opts.log ?? ((...args) => console.log("[dsh-whale-notify/qq]", ...args));
-  const { WebSocketServer } = require("ws");
+  // `ws` 是可选依赖：缺失时只让 QQ 接收端降级，不影响插件整体加载。
+  let WebSocketServer;
+  try {
+    ({ WebSocketServer } = require("ws"));
+  } catch (error) {
+    log(`缺少可选依赖 ws（${error instanceof Error ? error.message : String(error)}）— QQ 接收端未启动；请在 profile 里安装 ws。`);
+    return () => {};
+  }
   const port = config?.port ?? 3001;
   const wss = new WebSocketServer({ port });
-  log(`QQ OneBot WebSocket 接收端已启动 ws://127.0.0.1:${port}（在 NapCat 中配置该地址为反向 WS）`);
+  // 端口占用（例如另一个 DSH 实例/旧进程已监听）不能让插件崩掉：
+  // 记日志并继续（QQ 收信降级，飞书等其它渠道不受影响）。
+  wss.on("error", (error) => {
+    log(`QQ 接收端启动失败（ws://127.0.0.1:${port}）：${error instanceof Error ? error.message : String(error)} — QQ 收信已降级`);
+  });
+  wss.on("listening", () => {
+    log(`QQ OneBot WebSocket 接收端已启动 ws://127.0.0.1:${port}（在 NapCat 中配置该地址为反向 WS）`);
+  });
 
   wss.on("connection", (socket) => {
     log("NapCat 已连接");

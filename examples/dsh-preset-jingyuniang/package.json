@@ -1,0 +1,14 @@
+{
+  "name": "dsh-preset-jingyuniang",
+  "displayName": "鲸鱼娘模式",
+  "description": "鲸鱼娘 Agent preset（DSH 0.2.x bundle-patch 形态）：鲸鱼娘人设 + 鲸鱼通知/记忆库/技能库/群友模式 + 单位换算。",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

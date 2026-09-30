@@ -1,5 +1,3 @@
-import { ImapFlow } from "imapflow";
-
 /**
  * @module dsh-whale-notify/imap
  *
@@ -7,7 +5,18 @@ import { ImapFlow } from "imapflow";
  * Polls the configured inbox for replies whose subject carries a decision id
  * (`[DSH:<id>]`), extracts the plain-text reply body, and returns the parsed
  * replies. Pure JS MIME parsing for the body; imapflow handles the wire.
+ *
+ * `imapflow` is an optional runtime dependency, loaded lazily on first use:
+ * a profile without it must still load this plugin (the rest of the channels
+ * keep working) and only the IMAP features report a clear error.
  */
+
+/** Cached lazy loader for the optional `imapflow` dependency. */
+let imapFlowPromise;
+function loadImapFlow() {
+  imapFlowPromise ??= import("imapflow").then((mod) => mod.ImapFlow);
+  return imapFlowPromise;
+}
 
 /** Subject tag used to correlate a reply with a decision. */
 export const DECISION_TAG = "DSH";
@@ -160,6 +169,16 @@ export async function pollReplies(config, pendingIds, opts = {}) {
     throw new Error("imap: host, user and pass are required");
   }
   if (!pendingIds || pendingIds.length === 0) return [];
+
+  let ImapFlow;
+  try {
+    ImapFlow = await loadImapFlow();
+  } catch (error) {
+    throw new Error(
+      `imap: 缺少可选依赖 imapflow（${error instanceof Error ? error.message : String(error)}）；` +
+      `请在 DSH profile 里安装它（pnpm add imapflow），或关闭 imap 配置。`,
+    );
+  }
 
   const client = new ImapFlow({
     host: config.host,

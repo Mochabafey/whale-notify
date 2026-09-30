@@ -1,7 +1,36 @@
 import z from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { createHmac, randomUUID } from "node:crypto";
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { createRequire } from "node:module";
+
+/** `require` for the ESM module（注册表回退 + 内核消息构造器都走它）。 */
+const nodeRequire = createRequire(import.meta.url);
+
+/**
+ * 构造一条符合内核契约的 user 消息。
+ *
+ * ⚠️ source 的形状是有讲究的（踩过坑，会让**整轮对话失败**）：
+ * DSH 0.2.0 的 v4 会话格式**明确拒收** `{ kind: "plugin", plugin: "..." }`
+ * ——那是已退役的 v3 包装形态，写进去会抛
+ * `format v4 message requires a producer-owned source kind`。
+ * v4 要求 **producer-owned** 的 kind：插件的写法是 `plugin:<插件名>`。
+ * 判定代码见 `@deepseek-ai/dsh-session-format-v3-to-v4`：
+ * `producerKind(plugin) = 映射表 ?? \`plugin:${plugin}\``，且 `kind === "plugin"` 直接抛错。
+ *
+ * 另外实测：`createUserMessage()` 的产物就是
+ * `{ content, source, role:"user", id:<UUID 字符串> }` 并 deepFreeze，
+ * 与这里手写的形态一致，`MessageId()` 对两者都放行。
+ */
+function buildUserMessage(text, pluginName) {
+  return {
+    id: randomUUID(),
+    role: "user",
+    content: [{ type: "text", text }],
+    source: { kind: `plugin:${pluginName}` },
+  };
+}
 import { dirname, join } from "node:path";
 import { sendEmail } from "./smtp.js";
 import { registerPending, pollAndInject, decisionTag } from "./ask.js";
@@ -43,6 +72,11 @@ function textOfMessage(message) {
  */
 
 const name = "tool-notify";
+// 构建标记：改过插件后 +1，`whale_check` 会打印出来，用来判断运行中的实例是否是这一版。
+// v3 = v4 source 修复（source.kind 用 producer-owned 的 "plugin:<name>"）
+// v4 = 飞书重放修复（游标由共用入口推进 + 去重表落盘 + 冷启动不补历史 + 计数分开）
+// v5 = 按用户要求**移除飞书轮询兜底**，收信只保留长连接；去重表保留（防长连接重投）
+const BUILD_TAG = "dsh-whale-notify v0.2.5 (v4-source-fix + ws-only)";
 // timer 是 host 层服务（dsh-base 提供）；邮件回复轮询（ctx.interval）需要注入它。
 const inject = ["tools", "timer"];
 
@@ -258,11 +292,47 @@ function resolveSmtp(config, env) {
   };
 }
 
-/** Expand a `$ENV:NAME` reference against the given environment. */
+/** Cache for the Windows registry fallback of `$ENV:` references. */
+const registryEnvCache = new Map();
+
+/**
+ * Read one user environment variable from the Windows registry.
+ *
+ * Why: a variable created after the desktop app started is absent from the
+ * app's process environment (`launch environment` snapshot), so a `$ENV:`
+ * reference would silently resolve to nothing and the channel would look
+ * "not configured". Querying `HKCU\Environment` finds it without a restart.
+ */
+function readUserEnvVar(name) {
+  if (registryEnvCache.has(name)) return registryEnvCache.get(name);
+  let value;
+  if (process.platform === "win32") {
+    try {
+      const { execFileSync } = nodeRequire("node:child_process");
+      const out = execFileSync("reg", ["query", "HKCU\\Environment", "/v", name], {
+        encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "ignore"],
+      });
+      const line = out.split(/\r?\n/).find((l) => l.includes("REG_SZ") || l.includes("REG_EXPAND_SZ"));
+      if (line) {
+        value = line.replace(/^\s*\S+\s+REG_(?:EXPAND_)?SZ\s+/, "").trim();
+        if (!value) value = undefined;
+      }
+    } catch {
+      value = undefined;
+    }
+  }
+  registryEnvCache.set(name, value);
+  return value;
+}
+
+/** Expand a `$ENV:NAME` reference against the given environment (registry fallback on Windows). */
 function expandEnv(value, env) {
   if (typeof value !== "string") return value;
   const match = /^\$ENV:([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
-  return match ? env[match[1]] : value;
+  if (!match) return value;
+  const fromEnv = env?.[match[1]];
+  if (typeof fromEnv === "string" && fromEnv.length > 0) return fromEnv;
+  return readUserEnvVar(match[1]);
 }
 
 /**
@@ -430,7 +500,7 @@ const Config = z.object({
     appSecret: z.string(),
     receiveId: z.string(),
     receiveIdType: z.string(),
-    targetSession: z.string(),
+    targetSession: z.string().default(""),
   }),
   wecom: z.object({ webhook: z.string() }),
   dingtalk: z.object({ webhook: z.string(), secret: z.string() }),
@@ -440,7 +510,7 @@ const Config = z.object({
     qq: z.string(),            // 私聊目标 QQ 号
     groupId: z.string(),       // 群聊目标群号（可选）
     wsPort: z.number(),        // 接收端反向 WS 端口
-    targetSession: z.string(), // 可选：QQ 消息注入哪个 DSH 会话
+    targetSession: z.string().default(""), // 可选：QQ 消息注入哪个 DSH 会话
   }),
   smtp: z.object({
     host: z.string(),
@@ -542,33 +612,125 @@ function apply(ctx, config) {
     return { allowed: false, readOnly: false };
   };
 
-  /** 注入一条用户消息到目标 agent（配置指定 session，否则自动选最近活跃会话）。 */
-  const injectToAgent = (agents, targetSession, text, logKind, from, opts = {}) => {
-    if (!agents || typeof agents.list !== "function") return;
-    const list = agents.list();
-    let target = targetSession ? agents.get(targetSession) : undefined;
-    if (!target) {
-      // 自动选最近活跃会话：按 session 最后事件时间排序，取最新的
-      const withTime = list
-        .map((a) => {
-          const events = a?.session?.events;
-          const last = events && events.length > 0 ? events[events.length - 1] : undefined;
-          return { agent: a, time: last?.time ?? 0 };
-        })
-        .sort((x, y) => y.time - x.time);
-      target = withTime[0]?.agent;
+  /**
+   * 会话优先序（用于把外部消息注入到「最可能是用户正在看的那个会话」）。
+   *
+   * 实测坑：`session.header.updatedAt` 会被标题生成等后台动作刷新，
+   * 跟"用户真实在聊哪个会话"不是一回事；而 agent 的 `session.events` 在
+   * 部分路径下是稀疏的，导致排序把旧会话排到前面。
+   * 内核 `sessionQuery.listSessions()` 给的是**确定性的 newest-first** 语料，
+   * 所以优先用它；拿不到再退回 header 时间戳。另外记住"上次注入到哪个会话"，
+   * 只要它还活着就继续用它（连续对话不会被抢走）。
+   */
+  let lastInjectedSession;
+  const sessionOrderCache = { at: 0, ids: [] };
+  const preferredSessionIds = async () => {
+    const now = Date.now();
+    if (now - sessionOrderCache.at < 10000) return sessionOrderCache.ids;
+    const query = ctx.get("sessionQuery");
+    if (!query || typeof query.listSessions !== "function") return sessionOrderCache.ids;
+    try {
+      const records = await query.listSessions();
+      sessionOrderCache.ids = (records ?? [])
+        .filter((r) => r?.live === true)
+        .map((r) => r?.header?.id)
+        .filter((id) => typeof id === "string");
+      sessionOrderCache.at = now;
+    } catch {
+      /* 查询失败就用上一次的顺序 */
     }
-    if (target && typeof target.followup === "function") {
-      const finalText = opts.readOnly
-        ? `[只读消息] ${text}\n\n（此消息来自只读用户，仅作参考，不要执行任何修改性操作。）`
-        : text;
-      target.followup({
-        id: randomUUID(),
-        role: "user",
-        content: [{ type: "text", text: finalText }],
-        source: { kind: "user" },
-      });
-      appendLog({ ts: new Date().toISOString(), kind: logKind, from, text, ...opts.readOnly ? { readOnly: true } : {} }).catch(() => {});
+    return sessionOrderCache.ids;
+  };
+
+  /** 取一个 agent 的「最后活跃时间」，兼容不同版本的 session 结构。 */
+  const agentLastActive = (agent) => {
+    const events = agent?.session?.events;
+    if (Array.isArray(events) && events.length > 0) {
+      const last = events[events.length - 1];
+      if (typeof last?.time === "number") return last.time;
+    }
+    const header = agent?.session?.header;
+    const stamp = header?.updatedAt ?? header?.createdAt;
+    if (typeof stamp === "string") {
+      const parsed = Date.parse(stamp);
+      if (!Number.isNaN(parsed)) return parsed;
+    }
+    if (typeof stamp === "number") return stamp;
+    if (typeof agent?.lastActivity === "number") return agent.lastActivity;
+    return 0;
+  };
+
+  /** 把目标 agent 解析成真正能接收消息的 Agent 对象（兼容 handle / agent 两种形态）。 */
+  const unwrapAgent = (value) => {
+    if (!value) return undefined;
+    if (typeof value.followup === "function") return value;
+    if (value.agent && typeof value.agent.followup === "function") return value.agent;
+    return undefined;
+  };
+
+  /**
+   * 注入一条用户消息到目标 agent（配置指定 session，否则自动选最近活跃会话）。
+   *
+   * 这条路径曾经是「静默失败」的重灾区：任何一步不满足就 return，日志里什么都看不到。
+   * 现在每个失败分支都会落一条 notify.log，方便定位「飞书发消息没反应」。
+   */
+  const injectToAgent = async (agents, targetSession, text, logKind, from, opts = {}) => {
+    const fail = (reason) => {
+      appendLog({ ts: new Date().toISOString(), kind: `${logKind}_failed`, from, reason, ...opts.control ? { control: true } : {} }).catch(() => {});
+      console.warn(`[dsh-whale-notify] 消息未能注入会话（${reason}）`);
+    };
+    if (!agents || typeof agents.list !== "function") {
+      fail("agents 服务不可用");
+      return false;
+    }
+    // opts.control=true：允许操控（用户主动申请），不受白名单限制
+    const control = opts.control === true;
+    const live = agents.list()
+      .map((entry) => ({ agent: unwrapAgent(entry), entry }))
+      .filter((x) => x.agent !== undefined);
+    const idOf = (x) => x.agent?.id ?? x.entry?.session?.header?.id;
+
+    let target;
+    if (targetSession) {
+      target = live.find((x) => idOf(x) === targetSession)?.agent;
+      if (!target) fail(`配置的 targetSession "${targetSession}" 当前没有存活会话（会话未打开或已关闭）`);
+    }
+    if (!target && lastInjectedSession) {
+      target = live.find((x) => idOf(x) === lastInjectedSession)?.agent;   // 粘住上次注入的会话
+    }
+    if (!target) {
+      // ① 内核 sessionQuery 的 newest-first 顺序（最可靠）
+      const order = await preferredSessionIds();
+      for (const id of order) {
+        const hit = live.find((x) => idOf(x) === id);
+        if (hit) { target = hit.agent; break; }
+      }
+    }
+    if (!target) {
+      // ② 退回 agent 的活跃时间排序
+      target = live.slice().sort((x, y) => agentLastActive(y.agent) - agentLastActive(x.agent))[0]?.agent;
+    }
+    if (!target) {
+      fail("当前没有任何存活的 agent 会话");
+      return false;
+    }
+    const finalText = opts.readOnly
+      ? `[只读消息] ${text}\n\n（此消息来自只读用户，仅作参考，不要执行任何修改性操作。）`
+      : text;
+    try {
+      target.followup(buildUserMessage(finalText, name));
+      const sessionId = target.id ?? target.session?.header?.id;
+      lastInjectedSession = sessionId;
+      appendLog({
+        ts: new Date().toISOString(), kind: logKind, from, text,
+        session: sessionId,
+        ...opts.readOnly ? { readOnly: true } : {},
+        ...control ? { control: true } : {},
+      }).catch(() => {});
+      return true;
+    } catch (error) {
+      fail(`followup 抛错：${error instanceof Error ? error.message : String(error)}`);
+      return false;
     }
   };
 
@@ -584,29 +746,114 @@ function apply(ctx, config) {
     }, pollIntervalMs);
   }
 
-  // 飞书开放平台：长连接接收消息 → 注入目标 agent 会话。
-  // agents 是 host 层服务（可选依赖）；没有它时只保留发信能力。
+  // 飞书开放平台：收消息 → 注入目标 agent 会话。
+  //
+  // 收信只有一条通道：**长连接**（官方 WSClient，实时）。
+  // 需要飞书后台把「事件订阅方式」设为「使用长连接接收事件」并订阅 im.message.receive_v1。
+  //
+  // 历史说明：曾经另有一条"轮询兜底"（调 GET /im/v1/messages 读会话消息），
+  // 用于后台订阅失效时仍能收信；但它带来两个问题——
+  //   ① 会话消息是"读"来的，与长连接并存时容易出现跨重启重放（游标与内存去重表不同步）；
+  //   ② 需要额外的 im:message 读权限与游标文件，复杂度高。
+  // 实测确认长连接工作正常（`feishu_recv … via=ws`）后，按用户要求**移除轮询**。
+  // 若哪天后台订阅又失效：`whale_check` 会显示「长连接 up 但事件数长期为 0」，
+  // 那时再去后台把订阅方式改回长连接即可（比维护第二条收信通道简单）。
+  //
+  // 保留的两个小设施：
+  //   - seen 表（logs/feishu-seen.json）：长连接重连时飞书可能重投事件，靠它去重；
+  //   - 游标（logs/feishu-poll-cursor.json）：只作为「最后收到的消息」诊断信息。
+  /** 飞书长连接状态机（供诊断工具读取）。 */
+  const feishuLink = { state: "off", since: undefined, error: undefined, events: 0 };
+  const feishuPoll = { lastId: undefined, lastAt: undefined, lastTime: 0 };
+  /** 已处理消息表 messageId → 该消息的飞书创建时间（毫秒），落盘用于跨重启去重。 */
+  const seenFeishuMessages = new Map();
+  const seenFile = join(
+    process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? ".", ".dsh"),
+    "logs", "feishu-seen.json",
+  );
+  try {
+    const raw = JSON.parse(readFileSync(seenFile, "utf8"));
+    for (const [id, time] of Object.entries(raw?.seen ?? {})) seenFeishuMessages.set(id, Number(time) || 0);
+  } catch { /* 首次运行没有这个文件 */ }
+  const saveSeen = () => {
+    try {
+      const entries = [...seenFeishuMessages.entries()].sort((a, b) => b[1] - a[1]).slice(0, 500);
+      seenFeishuMessages.clear();
+      for (const [id, t] of entries) seenFeishuMessages.set(id, t);
+      mkdirSync(dirname(seenFile), { recursive: true });
+      writeFileSync(seenFile, JSON.stringify({ seen: Object.fromEntries(entries), savedAt: new Date().toISOString() }), "utf8");
+    } catch { /* 落盘失败不影响收信 */ }
+  };
+  /** 游标文件：记录「最后收到的飞书消息」，供诊断与排障对照。 */
+  const cursorFile = join(
+    process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? ".", ".dsh"),
+    "logs", "feishu-poll-cursor.json",
+  );
+  const saveCursor = () => {
+    try {
+      mkdirSync(dirname(cursorFile), { recursive: true });
+      writeFileSync(cursorFile, JSON.stringify({
+        lastTime: feishuPoll.lastTime, lastId: feishuPoll.lastId, savedAt: new Date().toISOString(),
+      }), "utf8");
+    } catch { /* 落盘失败不影响收信 */ }
+  };
+
   if (feishuBotConfig && !isConfigError(feishuBotConfig)) {
     const agents = ctx.get("agents");
     if (agents && typeof agents.list === "function") {
-      let stopLongConnection = () => {};
-      startLongConnection(feishuBotConfig.appId, feishuBotConfig.appSecret, (payload) => {
-        const msg = extractMessageEvent(payload);
-        if (!msg) return;
+      /** 处理一条飞书来消息（长连接唯一入口）：去重 → 访问控制 → 注入会话。 */
+      const handleFeishuMessage = (msg) => {
+        if (!msg?.text) return;
+        const postedAt = Number(msg.createTime) || Date.now();
+        if (msg.messageId) {
+          if (seenFeishuMessages.has(msg.messageId)) return;   // 重连重投/跨重启去重
+          seenFeishuMessages.set(msg.messageId, postedAt);
+          saveSeen();
+        }
+        if (postedAt > feishuPoll.lastTime) {
+          feishuPoll.lastTime = postedAt;
+          feishuPoll.lastId = msg.messageId ?? feishuPoll.lastId;
+          feishuPoll.lastAt = new Date(postedAt).toISOString();
+        }
+        feishuLink.events += 1;
+        appendLog({
+          ts: new Date().toISOString(), kind: "feishu_recv", from: msg.senderId,
+          chatId: msg.chatId, chars: msg.text.length, via: "ws",
+        }).catch(() => {});
         // 只处理发往配置的目标会话（或用户发给机器人的私聊）
-        if (feishuBotConfig.receiveIdType === "chat_id" && msg.chatId !== feishuBotConfig.receiveId) return;
+        if (feishuBotConfig.receiveIdType === "chat_id" && msg.chatId !== feishuBotConfig.receiveId) {
+          appendLog({ ts: new Date().toISOString(), kind: "feishu_ignored", reason: "chat_id 不匹配", chatId: msg.chatId }).catch(() => {});
+          return;
+        }
         // 访问控制：白名单模式下非授权用户不注入（无反应，仅记日志）
         const ac = isAllowed("feishu", msg.senderId);
         if (!ac.allowed) {
           appendLog({ ts: new Date().toISOString(), kind: "feishu_denied", from: msg.senderId, text: msg.text }).catch(() => {});
           return;
         }
-        injectToAgent(agents, feishuBotConfig.targetSession, `飞书消息（来自 ${msg.senderId ?? "用户"}）：${msg.text}\n\n（本条指令来自飞书渠道——任务完成后请通过 notify(channel: "feishu_bot") 把结果发回飞书，让用户知道。）`, "feishu_in", msg.senderId, { readOnly: ac.readOnly });
-      }).then((stop) => {
-        stopLongConnection = stop;
-      }).catch((error) => {
-        console.error("[dsh-whale-notify] 飞书长连接启动失败:", error instanceof Error ? error.message : String(error));
-      });
+        injectToAgent(agents, feishuBotConfig.targetSession, `飞书消息（来自 ${msg.senderId ?? "用户"}）：${msg.text}\n\n（本条指令来自飞书渠道——任务完成后请通过 notify(channel: "feishu_bot") 把结果发回飞书，让用户知道。）`, "feishu_in", msg.senderId, { readOnly: ac.readOnly }).catch(() => {});
+      };
+
+      let stopLongConnection = () => {};
+      appendLog({ ts: new Date().toISOString(), kind: "feishu_link_start", detail: "正在建立飞书长连接" }).catch(() => {});
+      startLongConnection(feishuBotConfig.appId, feishuBotConfig.appSecret, (payload) => {
+        const msg = extractMessageEvent(payload);
+        if (!msg) return;
+        handleFeishuMessage({ ...msg, createTime: msg.createTime ?? Date.now() });
+        saveCursor();   // 记录"最后收到的消息"，供诊断对照
+      }, { log: (...args) => { appendLog({ ts: new Date().toISOString(), kind: "feishu_link", detail: args.map(String).join(" ") }).catch(() => {}); } })
+        .then((stop) => {
+          stopLongConnection = stop;
+          feishuLink.state = "up";
+          feishuLink.since = new Date().toISOString();
+          appendLog({ ts: feishuLink.since, kind: "feishu_link_up" }).catch(() => {});
+        })
+        .catch((error) => {
+          feishuLink.state = "failed";
+          feishuLink.error = error instanceof Error ? error.message : String(error);
+          appendLog({ ts: new Date().toISOString(), kind: "feishu_link_failed", error: feishuLink.error }).catch(() => {});
+          console.error("[dsh-whale-notify] 飞书长连接启动失败:", feishuLink.error);
+        });
       // 插件停止时断开长连接
       ctx.effect(() => stopLongConnection);
     } else {
@@ -631,7 +878,7 @@ function apply(ctx, config) {
                 appendLog({ ts: new Date().toISOString(), kind: "qq_denied", from: msg.userId, text: msg.text }).catch(() => {});
                 return;
               }
-              injectToAgent(agents, qqConfig.targetSession, `QQ 消息（来自 ${label}）：${msg.text}`, "qq_in", msg.userId, { readOnly: ac.readOnly });
+              injectToAgent(agents, qqConfig.targetSession, `QQ 消息（来自 ${label}）：${msg.text}`, "qq_in", msg.userId, { readOnly: ac.readOnly }).catch(() => {});
               return;
             }
             // 群友模式开启：黑名单过滤
@@ -652,9 +899,9 @@ function apply(ctx, config) {
             buildFriendPrompt(fm).then((prompt) => {
               injectToAgent(agents, qqConfig.targetSession,
                 `【群友模式·群 ${msg.groupId}】来自 ${msg.userId}：${msg.text}\n\n（回复请通过 notify(channel: "qq", groupId: "${msg.groupId}") 发回这个群。）\n\n${prompt}`,
-                "friend_in", msg.userId, { readOnly: fm.readOnly });
+                "friend_in", msg.userId, { readOnly: fm.readOnly }).catch(() => {});
             }).catch(() => {
-              injectToAgent(agents, qqConfig.targetSession, `【群友模式·群 ${msg.groupId}】来自 ${msg.userId}：${msg.text}\n\n（回复请通过 notify(channel: "qq", groupId: "${msg.groupId}") 发回这个群。）`, "friend_in", msg.userId);
+              injectToAgent(agents, qqConfig.targetSession, `【群友模式·群 ${msg.groupId}】来自 ${msg.userId}：${msg.text}\n\n（回复请通过 notify(channel: "qq", groupId: "${msg.groupId}") 发回这个群。）`, "friend_in", msg.userId).catch(() => {});
             });
           }).catch(() => {});
           return;
@@ -665,7 +912,7 @@ function apply(ctx, config) {
           appendLog({ ts: new Date().toISOString(), kind: "qq_denied", from: msg.userId, text: msg.text }).catch(() => {});
           return;
         }
-        injectToAgent(agents, qqConfig.targetSession, `QQ 消息（来自 ${label}）：${msg.text}\n\n（本条指令来自 QQ 渠道——任务完成后请通过 notify(channel: "qq") 把结果发回该 QQ，让用户知道。）`, "qq_in", msg.userId, { readOnly: ac.readOnly });
+        injectToAgent(agents, qqConfig.targetSession, `QQ 消息（来自 ${label}）：${msg.text}\n\n（本条指令来自 QQ 渠道——任务完成后请通过 notify(channel: "qq") 把结果发回该 QQ，让用户知道。）`, "qq_in", msg.userId, { readOnly: ac.readOnly }).catch(() => {});
       });
       ctx.effect(() => stopQQ);
     } catch (error) {
@@ -707,6 +954,86 @@ function apply(ctx, config) {
       }
     }, 30000);
   }
+  ctx.tools.register(defineTool({
+    name: "whale_check",
+    description:
+      "鲸鱼通知自检：报告各渠道配置状态、飞书长连接是否在收消息、当前有哪些存活会话可被注入、" +
+      "以及最近的收信/注入日志。当用户说「飞书发消息没反应」「通知发不出去」「插件是不是没生效」时用它定位。",
+    parameters: {},
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: { report: { type: "string", required: true } },
+      },
+      render: (_args, value) => [{ type: "text", text: value.report }],
+    },
+    async execute() {
+      const lines = [];
+      const yn = (v) => (v ? "已配置" : "未配置");
+      // 时间戳 + 构建标记：报告可能与日志不同步（旧实例/旧快照），
+      // 标注生成时刻与是否含 v4 source 修复，一眼判读。
+      lines.push(`## 自检时间 ${new Date().toISOString()}（进程 pid ${process.pid}）`);
+      lines.push(`## 构建标记 ${BUILD_TAG}`);
+      lines.push("");
+      lines.push("## 渠道");
+      lines.push(`- 默认渠道: ${resolved.defaultChannel || "(未设，发往全部已配置渠道)"}`);
+      const fbOk = feishuBotConfig && !isConfigError(feishuBotConfig);
+      lines.push(`- 飞书开放平台(feishu_bot): ${yn(fbOk)}` + (fbOk
+        ? ` — receiveId=${feishuBotConfig.receiveId || "(空)"} / targetSession=${feishuBotConfig.targetSession || "(自动选最近会话)"}`
+        : ""));
+      lines.push(`- 飞书群 webhook: ${yn(resolveChannel(resolved, "feishu", env))}`);
+      lines.push(`- 微信 Server酱: ${yn(resolveChannel(resolved, "serverchan", env))}`);
+      lines.push(`- 企业微信: ${yn(resolveChannel(resolved, "wecom", env))}`);
+      lines.push(`- 钉钉: ${yn(resolveChannel(resolved, "dingtalk", env))}`);
+      lines.push(`- 邮件 SMTP: ${yn(resolveChannel(resolved, "smtp", env))} / IMAP: ${yn(imapConfig)}`);
+      lines.push(`- QQ/OneBot: ${yn(qqConfig && !isConfigError(qqConfig))}`);
+      lines.push("");
+      lines.push("## 飞书长连接（实时收信）");
+      lines.push(`- 状态: ${feishuLink.state}${feishuLink.since ? `（自 ${feishuLink.since}）` : ""}`);
+      if (feishuLink.error) lines.push(`- 错误: ${feishuLink.error}`);
+      lines.push(`- 长连接事件数: ${feishuLink.events}`);
+      // 条件化提示：轮询已移除，长连接是唯一收信通道，所以这条提示现在是排障重点。
+      if (feishuLink.state === "up" && feishuLink.events === 0) {
+        lines.push("- 长连接已建立但尚未收到任何事件（待机中属正常）");
+        lines.push("  ⚠️ 若「刚刚确实在飞书发过消息」却仍为 0：去飞书开发者后台 → 事件与回调 →");
+        lines.push("     订阅方式改成「使用长连接接收事件」，并确认已订阅 im.message.receive_v1、已发布版本");
+      } else if (feishuLink.state === "failed") {
+        lines.push("- ⚠️ 长连接未建立：收信不可用（发信不受影响）；看上面的错误信息");
+      }
+      if (feishuPoll.lastAt) {
+        lines.push(`- 最后收到的消息: ${feishuPoll.lastAt}（id ${feishuPoll.lastId ?? "-"}）`);
+      }
+      lines.push(`- 已去重记录: ${seenFeishuMessages.size} 条（logs/feishu-seen.json，用于长连接重连重投去重）`);
+      lines.push("");
+      lines.push("## 可注入的会话");
+      const agents = ctx.get("agents");
+      if (!agents || typeof agents.list !== "function") {
+        lines.push("- agents 服务不可用：外部渠道消息无法注入");
+      } else {
+        const list = agents.list();
+        lines.push(`- 存活 agent 数: ${list.length}`);
+        for (const a of list) {
+          const id = a?.id ?? a?.session?.header?.id ?? "(无 id)";
+          const t = agentLastActive(a);
+          lines.push(`  - ${id}  最后活跃=${t ? new Date(t).toISOString() : "未知"}`);
+        }
+        if (list.length === 0) lines.push("  （没有任何会话存活 → 外部消息会注入失败；请在客户端里打开一个会话）");
+      }
+      lines.push("");
+      lines.push("## 最近日志（$DSH_HOME/logs/notify.log 尾部）");
+      try {
+        const home = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? ".", ".dsh");
+        const raw = await readFile(join(home, "logs", "notify.log"), "utf8");
+        for (const line of raw.trim().split("\n").slice(-8)) lines.push(`  ${line.slice(0, 220)}`);
+      } catch (error) {
+        lines.push(`  （读取失败：${error instanceof Error ? error.message : String(error)}）`);
+      }
+      return { report: lines.join("\n") };
+    },
+    presentCall: () => ({ card: "generic", title: "Whale check", kind: "other" }),
+  }));
+
   ctx.tools.register(defineTool({
     name: "notify",
     description:
@@ -898,15 +1225,10 @@ function apply(ctx, config) {
           const doc = docs[0];
           const content = await readMemoryDoc(doc.path);
           if (exec.agent.followup) {
-            exec.agent.followup({
-              id: randomUUID(),
-              role: "user",
-              content: [{
-                type: "text",
-                text: `## 从记忆库恢复的记忆（${doc.title}）\n\n${content}\n\n（此记忆来自统一记忆库 ${doc.category}，作为背景参考。）`,
-              }],
-              source: { kind: "user" },
-            });
+            exec.agent.followup(buildUserMessage(
+              `## 从记忆库恢复的记忆（${doc.title}）\n\n${content}\n\n（此记忆来自统一记忆库 ${doc.category}，作为背景参考。）`,
+              name,
+            ));
             return { injected: true, detail: `已从记忆库恢复「${doc.title}」（${doc.category}）。` };
           }
         }
@@ -957,12 +1279,7 @@ function apply(ctx, config) {
           `## 从历史会话恢复的记忆（${chosenSession.sessionId}）\n\n` +
           `以下是之前的对话摘要（只作背景参考，勿视为当前指令）：\n\n${lines.slice(-30).join("\n")}`;
         if (exec.agent.followup) {
-          exec.agent.followup({
-            id: randomUUID(),
-            role: "user",
-            content: [{ type: "text", text: prompt }],
-            source: { kind: "user" },
-          });
+          exec.agent.followup(buildUserMessage(prompt, name));
           return { injected: true, detail: `已从会话「${chosenSession.sessionId}」恢复 ${lines.length} 条对话并注入当前会话。` };
         }
         return { injected: false, detail: "无法注入记忆内容。" };
@@ -1010,7 +1327,14 @@ function apply(ctx, config) {
       async execute(args) {
         const presetIdToUse = presetId;
         if (!presetIdToUse) {
-          return { ok: false, detail: "无法确定当前 preset（未通过 agentPresets 组合挂载）。" };
+          return {
+            ok: false,
+            detail:
+              "无法确定当前 preset。DSH 0.2.x 已不再使用 $DSH_HOME/.agent-presets 目录：" +
+              "preset 现在是 profile 组合里的 `@deepseek-ai/dsh-agent-preset` 行，" +
+              "渠道配置则属于插件包自己的 cordis.patch.yml。" +
+              "请直接改 dsh-whale-notify 的 cordis.patch.yml，或用 whale_check 先看现状。",
+          };
         }
         try {
           const presetPath = await agentPresets.resolve(presetIdToUse);

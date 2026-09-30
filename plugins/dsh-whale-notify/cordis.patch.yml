@@ -1,0 +1,118 @@
+# 鲸鱼通知（dsh-whale-notify）作为 profile bundle 的挂载点。
+# 这里的内容即 tool-notify 插件的运行配置（原在 agent preset 的 agent.cordis.yml 里，
+# 迁到这里后：任何 preset 的会话都能用到，也不依赖用户是否选了鲸鱼娘 preset）。
+# 语法：cordis loader patch —— 顶层数组，每条 { id, name, config }。
+- insert:
+  - id: tool-notify
+    name: 'dsh-whale-notify'
+    config:
+      # 不指定渠道时的默认发送渠道；留空表示发给所有已配置的渠道
+      defaultChannel: 'feishu_bot'
+
+      # ── 微信推送（Server酱，最简单，推荐先配这个）──
+      # 1. 用微信扫码登录 https://sct.ftqq.com 拿到 SendKey
+      # 2. 取消下面两行注释，把 SendKey 填进 sendKey（或存成环境变量 SERVERCHAN_SEND_KEY）
+      # serverchan:
+      #   sendKey: '$ENV:SERVERCHAN_SEND_KEY'
+
+      # ── 飞书机器人 ──
+      # 在飞书群里「设置 → 群机器人 → 添加机器人」创建自定义机器人，复制 webhook 地址。
+      # secret 是可选的安全签名密钥（创建机器人时可选「加签」）。
+      # feishu:
+      #   webhook: '$ENV:FEISHU_WEBHOOK'
+      #   secret: '$ENV:FEISHU_SECRET'
+
+      # ── 企业微信群机器人 ──
+      # 在企业微信群「添加群机器人」创建，复制 webhook 地址。
+      # wecom:
+      #   webhook: '$ENV:WECOM_WEBHOOK'
+
+      # ── 钉钉群机器人 ──
+      # 在钉钉群「智能群助手 → 添加机器人」创建，复制 webhook 地址。
+      # secret 是可选的安全加签密钥。
+      # dingtalk:
+      #   webhook: '$ENV:DINGTALK_WEBHOOK'
+      #   secret: '$ENV:DINGTALK_SECRET'
+
+      # ── 邮箱（SMTP）──
+      # 以飞书邮箱为例（官方参数：发信服务器 smtp.feishu.cn）：
+      #   1. 登录飞书网页版 → 头像 → 设置 → 邮箱设置 → 「外部收发信」→ 生成「专用密码」
+      #   2. 把专用密码存成环境变量 FEISHU_SMTP_PASS（不是登录密码！）
+      #   3. user/from 填发信账号（飞书邮箱），to 填你想收到通知的邮箱
+      # 端口说明：587 + secure: false 走 STARTTLS（推荐，实测更稳）；
+      #           465 + secure: true 走隐式 SSL（部分网络下可能超时）。
+      # 其他邮箱（QQ/163/Gmail）同理：host/port 换成对应服务器的即可。
+      # 账号与收件人一律用 $ENV: 引用，仓库里不放真实邮箱。
+      smtp:
+        host: 'smtp.feishu.cn'
+        port: 587                  # 587 + STARTTLS（实测比 465 更稳）
+        secure: false
+        user: '$ENV:NOTIFY_MAIL_USER'     # 你的发信账号
+        pass: '$ENV:FEISHU_SMTP_PASS'     # 专用密码，通过环境变量提供
+        from: '$ENV:NOTIFY_MAIL_USER'
+        fromName: 'JingYuNiang'           # 发件人显示名（收件方看到的名字，可中文，会自动编码）
+        to: ['$ENV:NOTIFY_MAIL_TO']       # 收件人：你的邮箱
+
+      # ── 收信（IMAP）：用于「ask_user_email」工具轮询用户的邮件回复 ──
+      # 官方参数：收信服务器 imap.feishu.cn，SSL 端口 993。
+      # 用户回复询问邮件后，回复会回到本收件箱，插件定期轮询并注入会话。
+      imap:
+        host: 'imap.feishu.cn'
+        port: 993
+        secure: true
+        user: '$ENV:NOTIFY_MAIL_USER'     # 收信账号（与 SMTP 同账号）
+        pass: '$ENV:FEISHU_SMTP_PASS'     # 同一个专用密码（SMTP/IMAP 通用）
+        mailbox: 'INBOX'                  # 轮询哪个文件夹（默认收件箱）
+      pollIntervalMs: 30000               # 每 30 秒轮询一次收件箱
+
+      # ── 飞书开放平台（自建应用）：双向聊天 ──
+      # 用途：① notify 可发消息到飞书；② 你在飞书里给机器人发消息，会注入 DSH 会话。
+      # 后台要求：事件与回调 → 订阅方式选「使用长连接接收事件」；订阅 im.message.receive_v1；
+      #           权限 im:message 等；配置后需发布新版本。
+      # receiveId 是目标会话（chat_id 或 open_id）；用 $ENV: 引用，仓库里不放真实会话 id。
+      feishuBot:
+        appId: '$ENV:FEISHU_APP_ID'
+        appSecret: '$ENV:FEISHU_APP_SECRET'
+        receiveId: '$ENV:FEISHU_CHAT_ID'
+        receiveIdType: 'chat_id'
+        targetSession: ''
+
+      # ── QQ（OneBot/NapCat）：双向聊天 ──
+      # 前提：本机运行 NapCat（登录机器人 QQ），HTTP API http://127.0.0.1:3000。
+      # qq 填「通知发往的 QQ 号」（你本人）；NapCat 登录的机器人号是收发载体。
+      # 号码一律用 $ENV: 引用，仓库里不放真实号码。
+      qq:
+        httpBase: 'http://127.0.0.1:3000'
+        accessToken: ''                 # OneBot 访问令牌（可选）
+        qq: '$ENV:NOTIFY_QQ'            # ← 通知发往：你的 QQ 号
+        groupId: '$ENV:NOTIFY_QQ_GROUP' # ← 群友模式回复的目标群
+        wsPort: 3001                    # 本插件监听反向 WS 的端口（NapCat 已配置连这里）
+        targetSession: ''
+
+      # ── 访问控制（黑白名单）──
+      # mode: whitelist = 仅白名单用户可指挥（推荐）；open = 所有人可指挥。
+      # allowedUsers: 可下达指令的用户（飞书 open_id / QQ 号，同样用 $ENV: 引用）。
+      # readOnlyUsers: 只读用户——消息会注入但标记为只读，agent 不执行修改操作。
+      # 名单外用户发消息无反应（不注入），仅记日志。
+      accessControl:
+        mode: 'whitelist'
+        allowedUsers:
+          feishu:
+            - '$ENV:NOTIFY_FEISHU_OPEN_ID'   # 你的飞书 open_id
+          qq:
+            - '$ENV:NOTIFY_QQ'               # ← 你的 QQ 号（指挥者）
+        readOnlyUsers:
+          feishu: []
+          qq: []
+
+      # ── 定时汇报（已停用：enableReports=false。要开就在对话里让 agent 改回 true）──
+      # 总开关 enableReports：默认 false（关闭）；设为 true 才启用定时汇报。
+      # schedule 格式："daily:HH:MM"（每日定点，如 daily:09:00）或 "every:N"（每 N 分钟，N>=5）。
+      # channel 用已配置的渠道（feishu_bot / smtp / qq 等）。
+      enableReports: false
+      reports:
+        - name: '每日晨报'
+          channel: 'feishu_bot'
+          schedule: 'daily:09:00'
+          text: '🐋 鲸鱼娘每日晨报：新的一天开始了！如有待办任务或需要关注的事项，请告诉我。'
+

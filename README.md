@@ -57,27 +57,53 @@ whale-notify/
 
 ## 🚀 快速开始
 
-### 1. 放置插件
+> ⚠️ **DSH 版本说明**：本文档以 **DSH 0.2.x** 为准。0.2.0 改了插件/preset 机制——
+> preset 不再是 `$DSH_HOME\.agent-presets\` 目录，而是 **profile 组合里的声明行**；
+> 插件也不再靠往 profile 的 `node_modules` 里拷目录来装，而是作为 **profile bundle** 安装。
+> 0.1.5 及更早的装法见文末「旧版本（DSH ≤ 0.1.5）」。
 
-把 `plugins/dsh-whale-notify` 复制到 DSH profile 的 node_modules：
+### 1. 作为 profile bundle 安装（0.2.x 推荐）
 
-```text
-$DSH_HOME\profiles\node_modules\dsh-whale-notify\
+把插件登记到目标 profile 的 `package.json`：
+
+```jsonc
+// $DSH_HOME/profiles/<profile>/package.json
+{
+  "dependencies": {
+    "dsh-whale-notify": "file:<本仓库绝对路径>/plugins/dsh-whale-notify",
+    "@larksuiteoapi/node-sdk": "^1.73.0",
+    "imapflow": "^1.7.1",
+    "ws": "^8.21.3"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-whale-notify"        // ← 加上这一行
+      ]
+    }
+  }
+}
 ```
 
-> ⚠️ 运行时依赖（装到同一 node_modules 目录）：
-> ```sh
-> cd <profile 目录> && npm install imapflow @larksuiteoapi/node-sdk
-> ```
+```powershell
+cd $env:DSH_HOME\profiles\<profile>
+pnpm install          # 用 DSH 客户端自带的 pnpm
+```
 
-### 2. 配置 preset
+**重启客户端**后在任意 preset 的会话里就有 `notify` / `whale_check` / 记忆库等工具了。
+插件的渠道配置在它自己的 `plugins/dsh-whale-notify/cordis.patch.yml` 里（单一数据源）。
 
-参考 `examples/agent.cordis.whale.yml`，把内容合并进你的 agent preset 的 `agent.cordis.yml`（用户 preset 位于 `$DSH_HOME\.agent-presets\<你的预设>\`）。
+### 2. 想要「鲸鱼娘」这个模式（可选）
+
+`examples/dsh-preset-jingyuniang/` 是一个预设 bundle：鲸鱼娘人设 + 标准模式全部能力。
+按它的 README 装成 bundle 后，模式选择器里就会出现「鲸鱼娘」。
 
 ### 3. 配置外部服务
 
 按 [📖 外部服务配置指南](docs/外部服务配置.md) 申请/配置：
-- **飞书开放平台应用**（双向聊天）
+- **飞书开放平台应用**（双向聊天，需要开启长连接订阅）
 - **NapCat + QQ**（QQ 双向聊天）
 - **邮箱 SMTP/IMAP**（邮件通知/问答）
 
@@ -87,24 +113,38 @@ $DSH_HOME\profiles\node_modules\dsh-whale-notify\
 # 飞书开放平台
 [Environment]::SetEnvironmentVariable("FEISHU_APP_ID", "cli_xxx", "User")
 [Environment]::SetEnvironmentVariable("FEISHU_APP_SECRET", "xxx", "User")
-# 邮箱授权码
-[Environment]::SetEnvironmentVariable("MAIL_PASS", "xxx", "User")
+[Environment]::SetEnvironmentVariable("FEISHU_CHAT_ID", "oc_xxx", "User")
+# 邮箱
+[Environment]::SetEnvironmentVariable("FEISHU_SMTP_PASS", "xxx", "User")
+[Environment]::SetEnvironmentVariable("NOTIFY_MAIL_USER", "you@example.com", "User")
+[Environment]::SetEnvironmentVariable("NOTIFY_MAIL_TO", "you@example.com", "User")
 ```
 
-> 🔑 **密钥只进环境变量，永不写进配置文件**。设置后需**新开窗口**重启 DSH（环境变量才会生效）。
+> 🔑 **密钥只进环境变量，永不写进配置文件**。
+> 插件的 `$ENV:` 解析会先查进程环境，**查不到时回退读 Windows 用户环境变量注册表**
+> （`HKCU\Environment`），所以刚设置的环境变量不用重启客户端也能生效。
 
 ### 5. 重启并开始使用
 
-```powershell
-dsh web
-```
+重启 DSH 客户端 → 新建会话（可选「鲸鱼娘」模式）→ 让它跑 `whale_check` 自检。
+之后**所有配置都可以在对话里完成**，详见 [📖 会话内配置指南](docs/会话内配置.md)。
 
-新建会话选 **鲸鱼娘** preset。之后**所有配置都可以在对话里完成**，详见 [📖 会话内配置指南](docs/会话内配置.md)。
+## 🐟 飞书收信：只走长连接（v0.2.5 起）
+
+收信由官方 `WSClient` 长连接实时接收。早期版本另有一条「轮询兜底」
+（调 `GET /im/v1/messages` 读会话消息），但它需要额外的 `im:message` 读权限，
+且与长连接并存时容易出现**跨重启重放**（游标只在轮询路径推进、去重表只在内存里）。
+实测确认长连接稳定工作后已移除，链路更简单。
+
+**需要在飞书开发者后台**：事件与回调 → 订阅方式选「使用长连接接收事件」，
+订阅 `im.message.receive_v1`，并发布版本。若这里没配对，
+`whale_check` 会显示「长连接已建立但事件数长期为 0」。
 
 ## 🔐 隐私与安全
 
 - 密钥一律 `$ENV:变量名` 引用，源码与配置示例不含真实密钥/邮箱/密码
 - 本仓库不含任何真实信息（示例均为占位符）
+- 提交前自查：`git ls-files -z | xargs -0 grep -nE '真实邮箱|真实号码|oc_[0-9a-f]{20,}|ou_[0-9a-f]{20,}'`（或按自己的标识 grep 一遍）
 - 记忆、聊天记录、日志全在 `$DSH_HOME\`（私密区），`.gitignore` 保护，不随仓库提交
 - App Secret 若曾在聊天中出现，建议到后台重置
 
@@ -113,6 +153,20 @@ dsh web
 ```sh
 node verify-notify.mjs    # mock HTTP + TLS SMTP，验证发送渠道与 SMTP 全流程（需 openssl）
 ```
+
+## 🕰 旧版本（DSH ≤ 0.1.5）
+
+0.1.5 及更早的机制是：
+
+1. 把 `plugins/dsh-whale-notify` 拷到 `$DSH_HOME\profiles\node_modules\dsh-whale-notify\`；
+2. 在 `$DSH_HOME\.agent-presets\<你的预设>\agent.cordis.yml` 里加一行
+   `- id: tool-notify / name: 'dsh-whale-notify' / config: …`
+   （参考 `examples/agent.cordis.whale.yml`）。
+
+> ⚠️ **0.2.0 起这套不再生效**：`.agent-presets` 目录不会被读取，
+> 而且 preset 里的插件名是相对 **harness 安装目录**解析的——插件只装在 profile 里时
+> 会被标成 `broken`，**整个 preset 会从客户端的模式选择器里消失**。
+> 请改用上面的 bundle 装法。
 
 ## 📄 许可
 

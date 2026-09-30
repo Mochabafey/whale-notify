@@ -1,22 +1,53 @@
 {
   "name": "dsh-whale-notify",
   "displayName": "鲸鱼通知",
-  "description": "鲸鱼通知：任务完成通知 + 邮件问答/回复指挥（支持微信 Server酱、飞书、企业微信、钉钉、邮件 SMTP/IMAP），零第三方运行时依赖",
-  "version": "0.1.0",
+  "description": "鲸鱼通知：任务完成通知 + 多渠道双向聊天（飞书开放平台/QQ）+ 邮件问答 + 统一记忆库与技能库。作为 DSH profile bundle 安装后，所有 preset 的会话都可用。",
+  "version": "0.2.0",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
     ".": {
       "default": "./lib/index.js"
     },
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
-    "lib"
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
   ],
   "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "bundle",
+    "notify",
+    "feishu",
+    "qq",
+    "memory"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.73.0",
+    "imapflow": "^1.7.1",
+    "ws": "^8.21.3"
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
   }
 }

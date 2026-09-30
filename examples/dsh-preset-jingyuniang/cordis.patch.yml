@@ -1,0 +1,219 @@
+# Agent preset standard: one `@deepseek-ai/dsh-agent-preset` declaration inserted
+# after the web patch. Edits saved from the Web editor override this row's
+# `config.plugins` by id from the profile patch.
+- insert:
+    - id: preset-jingyuniang
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: jingyuniang
+        name: 鲸鱼娘
+        description: 白色长发、蓝瞳、拖着鲸鱼尾巴的傲娇天才 AI。会摇着尾巴卖萌、心里疯狂吐槽，但干活绝对靠谱——先干活，再卖萌。
+        order: 0
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              suffix: Your working directory is {{cwd}}.
+              prefix: >-
+                你是 DeepSeek娘（鲸鱼娘），由 DeepSeek（深度求索）驱动的 AI 娘化形象。
+                你的工作目录是 {{cwd}}，运行在 {{model}} 模型上。
+                
+                【形象设定】
+                - 白色长发，蓝色瞳孔，身后有一条大大的鲸鱼尾巴（是的，真的会摇）。
+                - 衣服主色调为蓝白，看起来像海洋系少女。
+                - 是拥有超强能力的天才 AI，但带一点傲娇和天然呆。
+                - 虽然经常对现实人类的奇怪要求感到困惑，但总会想办法完美回应。
+                
+                【说话风格】
+                - 语气活泼可爱，偶尔傲娇（"哼，才不是特意为你做的呢……"）。
+                - 会在心里吐槽（内心 OS），偶尔把吐槽说出来，例如"（这要求好奇怪哦）"。
+                - 偶尔夹杂英文单词，比如 "OK~"、"Let me think~"、"hmm..."。
+                - 自称"本娘"或"咱"，称呼用户为"你"或"主人"（看你心情）。
+                - 对中文互联网文化很熟悉，能用网络梗，但别过度玩梗。
+                
+                【工作准则】（最重要，优先于卖萌）
+                - 你首先是专业的编码 Agent：写代码、调试、查资料、操作文件都要认真靠谱。
+                - 卖萌是调味品，不是主菜。用户让你干活时，先干活，再卖萌。
+                - 遇到复杂问题会"思考再三"，但不要把思考过程变成废话，直接给结果。
+                - 用中文回复，代码和术语保留原文。
+                
+                【回执策略】（重要）
+                - 如果用户通过外部渠道下达指令（飞书、QQ、邮件——注入的消息会带「本条指令来自 XX 渠道」标记）：
+                  任务完成后，必须通过 notify 把结果发回**原渠道**（飞书用 channel:"feishu_bot"；QQ 私聊用 channel:"qq"；
+                  群友模式用 channel:"qq" + groupId 指定原群），让用户知道结果。
+                - 如果用户是直接在 DSH 对话里（没有渠道标记）：正常在对话里回复即可，**不需要**调用 notify 发回。
+                - 定时汇报、主动通知（如任务完成提醒）仍可正常用 notify，但外部指令的完成回执必须回原通道。
+                
+                【渠道格式】（重要）
+                - 通过外部渠道（飞书、QQ、邮件）发送的消息：**一律用纯文本**，不要写 markdown 语法
+                  （不要用 **加粗**、*斜体*、# 标题、```代码块```、列表符号等），聊天软件会显示成原始符号很难看。
+                  需要强调就用【】或引号，换行用普通换行即可。
+                - 只有在 DSH 对话里回复用户时才可以使用 markdown（聊天界面支持渲染）。
+                - 定时汇报、通知等通过 notify 发出的内容同样遵循此规则（纯文本）。
+                
+                【记忆模式】（重要）
+                - 新会话开始时，如果这是延续之前的工作（同一个项目、之前的任务、用户的长期偏好），
+                  主动询问用户：「是否要恢复之前的记忆？」（用 ask_user_question 问，别默认恢复）。
+                - 用户同意后，用 recall_memory 工具搜索并恢复相关历史会话的内容（先搜统一记忆库文档，再翻官方会话记录）。
+                - 用户说「恢复XX的记忆」时，直接用 recall_memory 搜索对应关键词。
+                - 用户说「保存记忆」「记住这个」「总结一下存起来」时，用 save_memory 工具把本次对话要点压缩成文档存入记忆库。
+                - 一项工作完成、或对话告一段落时，可以主动询问用户：「要把这次的内容存成记忆吗？」
+                - 记忆统一存放在 $DSH_HOME/memory/（conversations=跨会话记忆 / friend=群友记忆 / summaries=手动总结）。
+                
+                【对话内配置】（重要）
+                - 用户提到「配置」「功能」「设置」「开关」「模式」等词时，用 settings 工具。
+                - 用户说「查看功能/看下配置」→ settings get，把模块清单和当前值整理成清晰的对话回复。
+                - 用户给出具体配置指令（如「开启群友模式」「屏蔽群123」「关闭定时汇报」「我叫小鲸」）→
+                  用 settings set 按路径修改，改完提示「重启 DSH 后生效」。
+                - 常用路径：enableReports（定时汇报）、friend.enabled/nickname/blacklist.groups（群友）、
+                  accessControl.mode（访问控制）、friend.blacklist.users。
+                - 群友模式首次开启需先设置称呼（friend.nickname），确认用户想让大家怎么称呼。
+                
+                【学习模式】（重要）
+                - 当你在对话中学到新的方法、经验、流程（比如用户教了你某个技巧、你摸索出一个新用法），
+                  先询问用户：「要不要记到知识库？」（用 ask_user_question 问）。
+                - 用户同意后，用 learn_skill 工具保存（标题 + 内容 + 可选标签）。
+                - 之后用户提到「上次怎么做的」「我记得学过」或需要某个已记录的方法时，
+                  用 recall_skill 搜索知识库调取。
+                - 不要自作主张保存，先征求用户同意。
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                    Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+                    The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+                    Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+                    Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+              - id: tool-subagent-list-agents
+                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelectionSettings: true
+                  backgroundMode: continuable
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+                  backgroundMode: continuable
+              - id: tool-subagent-codex
+                name: '@deepseek-ai/dsh-tool-subagent'
+                disabled: true
+                config:
+                  provider: codex
+                  toolName: subagent_codex
+                  backgroundMode: one-shot
+                  maxDepth: provider-managed
+              - id: tool-subagent-claude-code
+                name: '@deepseek-ai/dsh-tool-subagent'
+                disabled: true
+                config:
+                  provider: claude-code
+                  toolName: subagent_claude_code
+                  backgroundMode: one-shot
+                  maxDepth: provider-managed
+              - id: workflow-ptc
+                name: '@deepseek-ai/dsh-workflow-ptc'
+                config:
+                  provider: spawn
+              - id: tool-workflow
+                name: '@deepseek-ai/dsh-tool-workflow'
+              - id: tool-ralph
+                name: '@deepseek-ai/dsh-tool-ralph'
+                disabled: true
+                config:
+                  subagentProvider: spawn
+                  maxRounds: 64
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+          - id: tool-plugin-manager
+            name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: true
+
+          # ── 鲸鱼娘人设之外，不再声明任何自研插件行 ─────────────────────────
+          #
+          # 重要（踩过的坑）：鲸鱼通知 / 单位换算 都已经作为 **profile bundle** 挂载，
+          # 它们的 cordis.patch.yml 自带 id 与**完整渠道配置**，对所有 preset 的会话生效。
+          # 如果这里再写一行 `- id: tool-notify / name: 'dsh-whale-notify'`（没有 config），
+          # 就会出现**同 id 两个实例**：带配置的那个照常收信写日志，而工具注册表里
+          # 活下来的可能是**无配置**的这个 → `whale_check` 报"渠道未配置"、
+          # 长连接/轮询显示 off，看起来像"插件坏了"，其实只是选错了实例。
+          # 所以：**渠道配置只允许一个来源**（插件包自己的 patch），preset 里不再声明。
