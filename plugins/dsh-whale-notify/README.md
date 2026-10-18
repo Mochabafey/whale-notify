@@ -10,7 +10,7 @@ DeepSeek Harness（DSH）的通知、聊天机器人、记忆与知识库插件�
 | 工具 | 说明 |
 | --- | --- |
 | `notify(title, message, channel?, level?, awaitReply?, groupId?, to?)` | 发送通知：飞书开放平台 / QQ / 邮件 / Server酱 / 飞书 webhook / 企业微信 / 钉钉。超长文本按渠道上限自动分条 |
-| `plugin_tools(action, …)` | **插件能力索引**：`list` 按分类列出本会话可用的工具（含所属插件、前置条件、典型用法）；`call` 以当前身份连续调用 1-8 个工具，支持 `$N.field` 引用上一步返回值 |
+| `plugin_tools(action, …)` | **插件能力索引**：`list` 按分类列出本会话可用的工具（含所属插件、前置条件、典型用法）；`call` 以当前身份连续调用 1-8 个工具，支持 `$N.field` 引用上一步返回值；`guide` 取插件**使用手册**（前置条件/推荐流程/踩过的坑） |
 | `whale_check()` | **自检**：渠道、`$ENV:` 解析、访问控制名单、长连接状态、可注入会话、待回复决策、定时汇报、日志尾 |
 | `ask_user_email(question, context?, options?)` | 发邮件提问，回复自动注入会话（决策表落盘，重启后可恢复） |
 | `save_memory` / `recall_memory` | 统一记忆库（`$DSH_HOME/memory/`），检索按标题/标签/正文加权 |
@@ -60,6 +60,31 @@ plugin_tools(action: "call", steps: [
 失败语义也是显式的：默认遇错即停，并在结果里写明「第 N 步起未执行」以及怎么改成继续
 （`stop_on_error: false`）；参数不是合法 JSON 时给出解析位置而不是抛异常。
 
+## 📖 插件使用手册（`plugin_tools(action:"guide")`）
+
+`list` 只回答「有哪些工具、参数是什么」，回答不了「**到底怎么用才对**」。
+手册补上这一层，目前内置两本：
+
+| 手册 | 覆盖 | 内容 |
+| --- | --- | --- |
+| `ssh-ops` | `ssh_*` `sftp_*` `tunnel_*` `db_*`（40 个工具） | 当前连接的三种建立方式、connectionId 陷阱、`ssh_terminal_sessions` 缺陷、删除/高危 SQL 的可恢复语义、200 行截断、`ssh_batch` 需人工确认 |
+| `dsh-ops` | `ops_*`（5 个工具） | 严格参数（无 `run_in_background`）、长脚本先落盘、常驻进程改用 `pwsh`、ENOENT 诊断、background/ptc 组件默认关闭 |
+
+```text
+plugin_tools(action:"guide")                        # 列目录（按 keyword 推荐）
+plugin_tools(action:"guide", playbook:"ssh-ops")    # 整本手册
+```
+
+每条手册都是 **前置条件 → 推荐流程（可直接照抄的调用）→ 踩过的坑（现象/原因/正确做法）→ 怎么验证**，
+且会按**本机实际工具集**标出「能用几个」，插件没装时明确说「本机没有检测到」。
+
+另外，最关键的 6 条约束（connectionId 陷阱、SSH 前置开关、`ops_bash` 无后台…）会以
+**系统提示词 section** 常驻注册（602 字），所以即使模型没主动读手册也不会犯低级错误；
+注册随插件启停自动增减，不需要改 preset 文件。
+
+**归属修正**：`db_*` 一直由 **dsh-ssh-ops** 发布（数据库面板长在 SSH 面板里），
+早先被错标成「dsh-ops（数据库）」，会让模型去翻错的插件、也让用户找错设置项 —— 已修正。
+
 ## v0.3.0 修掉的问题
 
 | 问题 | 现象 | 现在 |
@@ -106,6 +131,7 @@ lib/
 ├── channels.js    # 各渠道最后一步发送
 ├── scheduler.js   # 定时汇报到点判定（分钟级去重）
 ├── registry.js    # 插件能力索引 + 跨插件工具调用（plugin_tools 的后端）
+├── playbooks.js   # ssh-ops / dsh-ops 使用手册 + 常驻提示词摘要
 ├── feishu.js      # 飞书开放平台（官方 WSClient）
 ├── qq.js          # OneBot 发送 + 反向 WS 接收
 ├── imap.js        # IMAP 轮询与回复解析

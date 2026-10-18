@@ -44,6 +44,9 @@ plugin_tools(action: "call", steps: [
   审批与沙箱**完全复用** `ctx.tools.execute`（`tools/pre-execute`、guard、timeout 包装器照常生效）；子调用继承外层 `signal`。
 - **失败可见**：默认遇错即停，并写明「第 N 步起未执行 + 怎么改成继续」；参数非法时报解析位置而不是抛异常。
 - 鲸鱼娘 preset 的提示词也新增了【插件能力·主动调用】一节，要求它**先查清单再动手**、不要造轮子。
+- 内置两本**使用手册**（`plugin_tools(action:"guide")`）：`ssh-ops` 与 `dsh-ops`，
+  内容是从真实排障里提炼的「前置条件 → 推荐流程 → 踩过的坑 → 怎么验证」；
+  最关键的 6 条同时作为系统提示词 section 常驻，模型不读手册也不会犯低级错误。
 
 ## 🆕 v0.3.0：适配 DSH 0.2.1 的一轮整修
 
@@ -92,6 +95,7 @@ whale-notify/
 │           ├── channels.js            # 各渠道最后一步发送（含分条）
 │           ├── scheduler.js           # 定时汇报到点判定（分钟级去重）
 │           ├── registry.js            # 插件能力索引 + 跨插件工具调用
+│           ├── playbooks.js           # ssh-ops / dsh-ops 使用手册
 │           ├── feishu.js              # 飞书开放平台（官方 SDK 长连接）
 │           ├── qq.js                  # QQ OneBot（发送 + 反向 WS 接收）
 │           ├── friendmode.js          # 群友模式（称呼/黑名单/提示词）

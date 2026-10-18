@@ -23,6 +23,7 @@ import {
 } from "./memory.js";
 import { createReportScheduler } from "./scheduler.js";
 import { buildInventory, callTool, summarizeInventory, parseStepArguments, MAX_BATCH } from "./registry.js";
+import { listPlaybooks, matchPlaybooks, renderPlaybook, promptDigest, getPlaybook, playbookKeyForTool, PLAYBOOKS } from "./playbooks.js";
 
 /**
  * @module dsh-whale-notify
@@ -365,6 +366,30 @@ function apply(ctx, config) {
     // 停插件时把环境缓存清掉，热重载后能读到最新变量
     clearEnvCache();
   }, "dsh-whale-notify cleanup");
+
+  // ────────────────────────── 插件用法要点（常驻提示词） ──────────────────────────
+  // 这些是「不写进每轮上下文就一定会做错」的几条（connectionId 陷阱、SSH 前置条件、
+  // ops_bash 无后台模式…）。细节留给 plugin_tools(action:"guide")，这里只放摘要，
+  // 避免把整套手册塞进每一轮。
+  //
+  // 注册成 prompt section（而不是 preset 里的固定文本），这样：
+  //  - 插件被禁用/卸载时这段提示自动消失；
+  //  - 用户不必去改 preset 文件，升级插件即可拿到最新的用法要点。
+  {
+    const systemPrompt = ctx.get("systemPrompt");
+    if (systemPrompt && typeof systemPrompt.section === "function") {
+      try {
+        ctx.effect(() => systemPrompt.section({
+          name: "plugin:whale-notify/plugin-usage",
+          // 放在工具说明之后、persona suffix 之前；不抢人设的位置。
+          order: 5200,
+          text: promptDigest(),
+        }), "dsh-whale-notify usage digest");
+      } catch (error) {
+        console.warn("[dsh-whale-notify] 用法要点未能注册进提示词:", error instanceof Error ? error.message : String(error));
+      }
+    }
+  }
 
   // 迁移旧的群友记忆（friendmode/memory.jsonl → memory/friend/）
   migrateLegacyFriendMemory().then((count) => {
@@ -1597,8 +1622,14 @@ function apply(ctx, config) {
       action: {
         type: "string",
         required: true,
-        enum: ["list", "call"],
-        description: "list=查看可用工具清单；call=调用工具。",
+        enum: ["list", "call", "guide"],
+        description:
+          "list=查看可用工具清单；call=调用工具；guide=取某个插件的**使用手册**"
+          + "（前置条件、推荐流程、踩过的坑，比单个工具描述完整得多）。",
+      },
+      playbook: {
+        type: "string",
+        description: "guide 用：手册名，目前有 ssh-ops（SSH/SFTP/隧道/数据库）与 dsh-ops（ops_* 文件与 bash）。",
       },
       group: {
         type: "string",
@@ -1692,7 +1723,49 @@ function apply(ctx, config) {
           lines.push(`另有 ${hidden.length} 个工具对本会话不可见（加 include_unavailable: true 查看）。`);
         }
         lines.push("要连续调用多步，用 plugin_tools(action: \"call\", steps: [{tool, arguments}, …])。");
+        // 指南针：看到 ssh_*/db_*/ops_* 这类有大量前置条件的工具族，提示先读手册。
+        const families = [...new Set(
+          inventory.entries
+            .filter((entry) => entry.visible)
+            .map((entry) => playbookKeyForTool(entry.name))
+            .filter(Boolean),
+        )];
+        if (families.length > 0) {
+          lines.push("");
+          lines.push(`💡 这些工具族有详细手册（前置条件/推荐流程/踩坑）：${families.map((key) => `plugin_tools(action:"guide", playbook:"${key}")`).join("、")}`);
+        }
         return { detail: lines.join("\n"), results: [] };
+      }
+
+      // ── guide：取插件使用手册 ──
+      if (args.action === "guide") {
+        const inventory = buildInventory(tools, exec.agent);
+        const toolNames = inventory.entries.map((entry) => entry.name);
+        const wanted = String(args.playbook ?? "").trim();
+
+        // 没指定手册：列目录（并按 keyword 推荐）
+        if (wanted === "") {
+          const books = listPlaybooks();
+          const recommended = args.keyword ? matchPlaybooks(args.keyword) : [];
+          const lines = ["## 可用插件手册", ""];
+          for (const book of books) {
+            const prefixes = getPlaybook(book.key)?.entry.toolPrefixes ?? [];
+            const count = toolNames.filter((name) => prefixes.some((prefix) => name.startsWith(prefix))).length;
+            const mark = recommended.includes(book.key) ? " ← 相关" : "";
+            lines.push(`- **${book.key}** — ${book.title}（本机 ${count} 个工具）${mark}`);
+            lines.push(`  ${book.summary}`);
+          }
+          lines.push("");
+          lines.push('用法：plugin_tools(action:"guide", playbook:"ssh-ops")');
+          return { detail: lines.join("\n"), results: [] };
+        }
+
+        const markdown = renderPlaybook(wanted, { toolNames });
+        if (markdown === undefined) {
+          const keys = Object.keys(PLAYBOOKS).join(", ");
+          return { detail: `没有名为「${wanted}」的手册。可用：${keys}`, results: [] };
+        }
+        return { detail: markdown, results: [] };
       }
 
       // ── call ──

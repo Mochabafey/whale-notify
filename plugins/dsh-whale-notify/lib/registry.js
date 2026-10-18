@@ -48,12 +48,7 @@ const TOOL_NOTES = {
   edit: { owner: "DSH 内置", group: "文件", hint: "按字面量替换做精确编辑，优于整文件重写" },
   glob: { owner: "DSH 内置", group: "文件", hint: "按路径模式找文件" },
   grep: { owner: "DSH 内置", group: "文件", hint: "按正则搜文件内容" },
-  ops_inspect_local_file: { owner: "DSH 内置", group: "文件", hint: "读文件的分页/hex 视图" },
-  ops_glob: { owner: "DSH 内置", group: "文件", hint: "glob 的 ops 版本，支持 include/exclude 列表" },
-  ops_grep: { owner: "DSH 内置", group: "文件", hint: "grep 的 ops 版本，支持上下文行" },
-  ops_replace: { owner: "DSH 内置", group: "文件", hint: "批量正则替换（带 dryRun 预览）" },
-  ops_bash: { owner: "DSH 内置", group: "命令", hint: "跑 bash 命令/管道/脚本；长脚本用 script_path" },
-  pwsh: { owner: "DSH 内置", group: "命令", hint: "跑 PowerShell；Windows 原生命令用这个" },
+  pwsh: { owner: "DSH 内置（dsh-ops 会换成随包 PowerShell 7）", group: "命令", hint: "跑 PowerShell；Windows 原生命令、需要后台时用它" },
   working_directory: { owner: "DSH 内置", group: "命令", hint: "读取/切换当前工作目录" },
   load_workspace_dependencies: { owner: "DSH 内置", group: "命令", hint: "拿内置 Python/Node/pnpm 的绝对路径与已装库" },
   todo_write: { owner: "DSH 内置", group: "协作", hint: "多步任务清单，长任务先列再干" },
@@ -88,27 +83,59 @@ const TOOL_NOTES = {
   recall_skill: { owner: "鲸鱼通知", group: "记忆", hint: "从知识库检索已记的经验" },
   plugin_tools: { owner: "鲸鱼通知", group: "插件", hint: "本工具：索引并调用其它插件的工具" },
 
-  // ── dsh-ops：数据库与运维 ──
-  db_connect: {
-    owner: "dsh-ops（数据库）",
-    group: "数据库",
-    prereq: "连接成功后拿到 db_connection_id",
-    hint: "连接 MySQL/PG/openGauss/SQLite/ClickHouse/Redis/MongoDB；本机服务会自动走 SSH 隧道",
+  // ── dsh-ops：高性能文件检索 + 随包 bash/pwsh7 ──
+  // 注意：以前这里写成「DSH 内置」，会让人误以为是内核自带，找不到该去哪个插件里调。
+  ops_glob: {
+    owner: "dsh-ops", group: "文件",
+    hint: "Rust 实现的多模式找路径（比 glob 快），支持排除、分页",
+    prereq: "返回 JSON：items/matched/total/truncated/nextOffset",
   },
-  db_query: { owner: "dsh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "只读查询（只允许 SELECT/SHOW 等）" },
-  db_execute: { owner: "dsh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "写操作（DROP/TRUNCATE 会被拦截为备份+改名）" },
-  db_run: { owner: "dsh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "Redis 命令 / MongoDB 操作" },
-  db_preview: { owner: "dsh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "抽样看表数据" },
-  db_describe_table: { owner: "dsh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "表结构/索引/外键" },
-  db_explain: { owner: "dsh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "执行计划（优化索引前看这个）" },
-  db_export: { owner: "dsh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "导出查询结果为 CSV/JSON" },
-  db_list_tables: { owner: "dsh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "列出当前库的表" },
-  db_list_connections: { owner: "dsh-ops（数据库）", group: "数据库", hint: "当前打开的数据库连接" },
-  db_disconnect: { owner: "dsh-ops（数据库）", group: "数据库", hint: "关闭数据库连接" },
-  db_tx_begin: { owner: "dsh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "开事务（配合 tx_execute 验证后 commit）" },
-  db_tx_execute: { owner: "dsh-ops（数据库）", group: "数据库", prereq: "先 db_tx_begin", hint: "事务内执行一条语句" },
-  db_tx_commit: { owner: "dsh-ops（数据库）", group: "数据库", prereq: "验证无误后", hint: "提交事务" },
-  db_tx_rollback: { owner: "dsh-ops（数据库）", group: "数据库", hint: "回滚事务" },
+  ops_grep: {
+    owner: "dsh-ops", group: "文件",
+    hint: "Rust 正则搜索，支持上下文行与 count/summary 模式",
+    prereq: "outputMode: files_with_matches / content / count / summary",
+  },
+  ops_replace: {
+    owner: "dsh-ops", group: "文件",
+    hint: "跨文件批量正则替换；先 dryRun 预览命中数",
+    prereq: "read-only 模式拒绝替换；精确单点编辑仍用宿主 edit",
+  },
+  ops_inspect_local_file: {
+    owner: "dsh-ops", group: "文件",
+    hint: "读文件的分页 / 编码 / PDF 文本 / hex 视图",
+    prereq: "大文件用 offset/limit 续读",
+  },
+  ops_bash: {
+    owner: "dsh-ops", group: "命令",
+    hint: "随包 bash（优先于宿主 shell）；长脚本用 script_path",
+    prereq:
+      "参数严格，只有 command/script_path/description/workdir/timeoutMs/graceMs；"
+      + "**没有 run_in_background**（常驻进程改用宿主 pwsh）",
+  },
+
+  // ── dsh-ssh-ops：SSH / SFTP / 隧道 / 数据库 ──
+  // 历史错误：这里的 db_* 曾被标成「dsh-ssh-ops（数据库）」。实际由 dsh-ssh-ops 发布
+  // （数据库面板就长在 SSH 面板里），标错会让模型去翻错的插件、也让用户找错设置项。
+  db_connect: {
+    owner: "dsh-ssh-ops（数据库）",
+    group: "数据库",
+    prereq: "连接成功后拿到 db_connection_id（注意返回值里字段名是 dbConnectionId）",
+    hint: "连 MySQL/PG/openGauss/SQLite/ClickHouse/Redis/MongoDB；host 写 127.0.0.1 且已连服务器时会自动走 SSH 隧道",
+  },
+  db_query: { owner: "dsh-ssh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "只读查询（只允许 SELECT/SHOW 等）" },
+  db_execute: { owner: "dsh-ssh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "写操作（DROP/TRUNCATE 会被拦截为备份+改名）" },
+  db_run: { owner: "dsh-ssh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "Redis 命令 / MongoDB 操作" },
+  db_preview: { owner: "dsh-ssh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "抽样看表数据" },
+  db_describe_table: { owner: "dsh-ssh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "表结构/索引/外键" },
+  db_explain: { owner: "dsh-ssh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "执行计划（优化索引前看这个）" },
+  db_export: { owner: "dsh-ssh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "导出查询结果为 CSV/JSON" },
+  db_list_tables: { owner: "dsh-ssh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "列出当前库的表" },
+  db_list_connections: { owner: "dsh-ssh-ops（数据库）", group: "数据库", hint: "当前打开的数据库连接" },
+  db_disconnect: { owner: "dsh-ssh-ops（数据库）", group: "数据库", hint: "关闭数据库连接" },
+  db_tx_begin: { owner: "dsh-ssh-ops（数据库）", group: "数据库", prereq: "先 db_connect", hint: "开事务（配合 tx_execute 验证后 commit）" },
+  db_tx_execute: { owner: "dsh-ssh-ops（数据库）", group: "数据库", prereq: "先 db_tx_begin", hint: "事务内执行一条语句" },
+  db_tx_commit: { owner: "dsh-ssh-ops（数据库）", group: "数据库", prereq: "验证无误后", hint: "提交事务" },
+  db_tx_rollback: { owner: "dsh-ssh-ops（数据库）", group: "数据库", hint: "回滚事务" },
 
   // ── dsh-ssh-ops：SSH / SFTP / 隧道 ──
   ssh_connect: {
@@ -173,7 +200,7 @@ const PREFIX_NOTES = [
   { prefix: "ssh_", owner: "dsh-ssh-ops", group: "SSH" },
   { prefix: "sftp_", owner: "dsh-ssh-ops", group: "SSH" },
   { prefix: "tunnel_", owner: "dsh-ssh-ops", group: "SSH" },
-  { prefix: "db_", owner: "dsh-ops（数据库）", group: "数据库" },
+  { prefix: "db_", owner: "dsh-ssh-ops（数据库）", group: "数据库" },
   { prefix: "ops_", owner: "DSH 内置", group: "文件/命令" },
   { prefix: "office_", owner: "DSH Office", group: "文档" },
   { prefix: "schedule_", owner: "DSH 内置", group: "定时" },
