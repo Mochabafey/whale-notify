@@ -1,57 +1,69 @@
 import z from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import { createHmac, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { createRequire } from "node:module";
-
-/** `require` for the ESM module（注册表回退 + 内核消息构造器都走它）。 */
-const nodeRequire = createRequire(import.meta.url);
-
-/**
- * 构造一条符合内核契约的 user 消息。
- *
- * ⚠️ source 的形状是有讲究的（踩过坑，会让**整轮对话失败**）：
- * DSH 0.2.0 的 v4 会话格式**明确拒收** `{ kind: "plugin", plugin: "..." }`
- * ——那是已退役的 v3 包装形态，写进去会抛
- * `format v4 message requires a producer-owned source kind`。
- * v4 要求 **producer-owned** 的 kind：插件的写法是 `plugin:<插件名>`。
- * 判定代码见 `@deepseek-ai/dsh-session-format-v3-to-v4`：
- * `producerKind(plugin) = 映射表 ?? \`plugin:${plugin}\``，且 `kind === "plugin"` 直接抛错。
- *
- * 另外实测：`createUserMessage()` 的产物就是
- * `{ content, source, role:"user", id:<UUID 字符串> }` 并 deepFreeze，
- * 与这里手写的形态一致，`MessageId()` 对两者都放行。
- */
-function buildUserMessage(text, pluginName) {
-  return {
-    id: randomUUID(),
-    role: "user",
-    content: [{ type: "text", text }],
-    source: { kind: `plugin:${pluginName}` },
-  };
-}
 import { dirname, join } from "node:path";
+
+import {
+  CHANNELS, CHANNEL_LABELS, clearEnvCache, configuredChannels, describeEnvRefs,
+  isConfigError, resolveAccessControl, resolveChannel, resolveImap,
+} from "./config.js";
+import { formatTitle, targetChannels, trySend } from "./channels.js";
 import { sendEmail } from "./smtp.js";
-import { registerPending, pollAndInject, decisionTag } from "./ask.js";
-import { getTenantToken, sendText, startLongConnection, extractMessageEvent } from "./feishu.js";
-import { sendQQ, startQQReceiver } from "./qq.js";
-import { saveSkill, searchSkills, readSkill, knowledgeDir } from "./knowledge.js";
+import { registerPending, restorePending, pollAndInject, pendingIds, decisionTag } from "./ask.js";
+import { startLongConnection, extractMessageEvent } from "./feishu.js";
+import { startQQReceiver } from "./qq.js";
+import { saveSkill, searchSkills, knowledgeDir } from "./knowledge.js";
 import {
   readFriendConfig, writeFriendConfig, readFriendPrompts, appendFriendMemory,
-  readFriendMemory, isBlacklisted, buildFriendPrompt, friendModeDir,
+  isBlacklisted, buildFriendPrompt, friendModeDir, DEFAULT_PROMPTS,
 } from "./friendmode.js";
-import { saveMemoryDoc, searchMemoryDocs, readMemoryDoc, memoryDir, migrateLegacyFriendMemory } from "./memory.js";
+import {
+  saveMemoryDoc, searchMemoryDocs, readMemoryDoc, memoryDir, migrateLegacyFriendMemory,
+} from "./memory.js";
+import { createReportScheduler } from "./scheduler.js";
+import { buildInventory, callTool, summarizeInventory, parseStepArguments, MAX_BATCH } from "./registry.js";
 
-/** Append one JSONL record to $DSH_HOME/logs/notify.log (creates dir/file). */
-async function appendLog(record) {
-  const home = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? ".", ".dsh");
-  const dir = join(home, "logs");
-  await mkdir(dir, { recursive: true });
-  await appendFile(join(dir, "notify.log"), `${JSON.stringify(record)}\n`, "utf8");
+/**
+ * @module dsh-whale-notify
+ *
+ * 鲸鱼通知：任务通知 + 飞书/QQ 双向聊天 + 邮件问答 + 统一记忆库/知识库。
+ *
+ * 结构约定：
+ *  - `./config.js`   —— 配置解析（`$ENV:` 展开、渠道规范化、访问控制名单）
+ *  - `./channels.js` —— 各渠道的最后一步发送与文本切分
+ *  - `./scheduler.js`—— 定时汇报的到点判定
+ *  - 本文件          —— 工具注册、外部消息注入、定时任务编排
+ */
+
+/** Plugin name registered with the Loader. */
+const name = "tool-notify";
+
+// 构建标记：改过插件后 +1，`whale_check` 会打印出来，用来判断运行中的实例是不是这一版。
+// v5 = 移除飞书轮询，收信只走长连接
+// v6 = 访问控制名单展开 + SMTP/IMAP 注册表回退 + QQ wsPort 修复 + settings 改走 configEditor
+const BUILD_TAG = "dsh-whale-notify v0.3.0 (v6-config-rewrite)";
+
+/** Host services this plugin consumes. `timer` backs every interval/timeout. */
+const inject = ["tools", "timer"];
+
+/** Resolve `$DSH_HOME` (falls back to `%USERPROFILE%\.dsh`). */
+function dshHome() {
+  return process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? ".", ".dsh");
 }
 
-/** Extract plain text from a message's content blocks (user or assistant). */
+/** Append one JSONL record to `$DSH_HOME/logs/notify.log`. */
+async function appendLog(record) {
+  try {
+    const dir = join(dshHome(), "logs");
+    await mkdir(dir, { recursive: true });
+    await appendFile(join(dir, "notify.log"), `${JSON.stringify({ ts: new Date().toISOString(), ...record })}\n`, "utf8");
+  } catch {
+    // 日志写不进去不影响功能
+  }
+}
+
+/** Extract plain text from a message's content blocks. */
 function textOfMessage(message) {
   if (!message?.content || !Array.isArray(message.content)) return "";
   return message.content
@@ -62,437 +74,90 @@ function textOfMessage(message) {
 }
 
 /**
- * @module dsh-whale-notify
+ * Build a kernel-valid v4 user message.
  *
- * Model-facing `notify` tool. Sends a completion/status message through one
- * or more configured channels: WeChat (ServerChan), Feishu, WeCom, DingTalk,
- * and email (SMTP). All transport uses the host runtime's native `fetch` and
- * `node:net`/`node:tls` — no runtime dependencies beyond the DSH tool
- * registry and cordis.
+ * ⚠️ v4 会话格式只接受 **producer-owned** 的 source.kind：`{ kind: "plugin" }`
+ * 是已退役的 v3 包装，写进去会抛
+ * `format v4 message requires a producer-owned source kind`。插件的写法是
+ * `plugin:<插件名>`，普通用户消息是 `user`。
  */
-
-const name = "tool-notify";
-// 构建标记：改过插件后 +1，`whale_check` 会打印出来，用来判断运行中的实例是否是这一版。
-// v3 = v4 source 修复（source.kind 用 producer-owned 的 "plugin:<name>"）
-// v4 = 飞书重放修复（游标由共用入口推进 + 去重表落盘 + 冷启动不补历史 + 计数分开）
-// v5 = 按用户要求**移除飞书轮询兜底**，收信只保留长连接；去重表保留（防长连接重投）
-const BUILD_TAG = "dsh-whale-notify v0.2.5 (v4-source-fix + ws-only)";
-// timer 是 host 层服务（dsh-base 提供）；邮件回复轮询（ctx.interval）需要注入它。
-const inject = ["tools", "timer"];
-
-/** Schema of the `notify` tool's parameters (registry-facing JSON Schema). */
-const PARAMETERS = {
-  title: {
-    type: "string",
-    required: true,
-    description: "通知标题，例如「任务完成」或「构建失败」。",
-  },
-  message: {
-    type: "string",
-    required: true,
-    description: "通知正文。发送到机器人渠道时是纯文本；发送邮件时是邮件正文（纯文本）。",
-  },
-  channel: {
-    type: "string",
-    description:
-      "要发送的渠道。可用渠道：feishu_bot（飞书开放平台，双向聊天，推荐）、qq（QQ，需 NapCat）、" +
-      "serverchan（微信）、feishu（飞书群 webhook）、wecom（企业微信）、dingtalk（钉钉）、smtp（邮箱）。" +
-      "不填时使用默认渠道；填 all 则发送到所有已配置的渠道。未配置的渠道会被跳过。",
-    enum: ["all", "serverchan", "feishu", "feishu_bot", "qq", "wecom", "dingtalk", "smtp"],
-  },
-  level: {
-    type: "string",
-    description: "可选的通知级别，会在标题前加上对应标签，例如 [完成]、[错误]。",
-    enum: ["info", "success", "warning", "error"],
-  },
-  awaitReply: {
-    type: "boolean",
-    description:
-      "设为 true 时，邮件通知会附带决策编号，你直接回复该邮件即可给 agent 下达下一步指令，" +
-      "回复内容会自动注入回当前会话。仅对邮件渠道生效；要求配置了 imap。",
-  },
-  groupId: {
-    type: "string",
-    description:
-      "仅 QQ 渠道用：要发往的群号。群友模式回复时填上被 @ 的那个群号即可把回复发回群里；" +
-      "不填则用配置里的默认 groupId，都没有则发私聊。",
-  },
-};
-
-/** Schema of the `ask_user_email` tool's parameters. */
-const ASK_PARAMETERS = {
-  question: {
-    type: "string",
-    required: true,
-    description: "要问用户的问题，例如「是否允许我删除这些临时文件？」或「接下来先做哪个任务？」。",
-  },
-  context: {
-    type: "string",
-    description: "可选的背景信息，会附在邮件里帮助用户决策。",
-  },
-  options: {
-    type: "array",
-    description: "可选的建议选项（例如 ['继续', '取消']），用户可以直接回复选项文字。",
-    items: { type: "string" },
-  },
-};
-
-/** Default HTTP timeout for webhook calls, in milliseconds. */
-const HTTP_TIMEOUT_MS = 15000;
-
-/** Fetch with a hard timeout via AbortController (host runtime has fetch). */
-async function fetchWithTimeout(url, options = {}, timeoutMs = HTTP_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error(`request timed out after ${timeoutMs}ms`)), timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/** Read a JSON error message from a failed webhook response body. */
-async function readErrorBody(response) {
-  try {
-    const text = await response.text();
-    const trimmed = text.trim();
-    if (trimmed.length === 0) return "";
-    try {
-      const parsed = JSON.parse(trimmed);
-      const pick = parsed.msg || parsed.message || parsed.errmsg || parsed.error;
-      return typeof pick === "string" ? pick : trimmed.slice(0, 200);
-    } catch {
-      return trimmed.slice(0, 200);
-    }
-  } catch {
-    return "";
-  }
-}
-
-/** Assert a 2xx response; throw with a channel-specific message otherwise. */
-async function assertOk(response, channelLabel, url) {
-  if (!response.ok) {
-    const detail = await readErrorBody(response);
-    throw new Error(`${channelLabel} failed (HTTP ${response.status}${detail ? `: ${detail}` : ""})`);
-  }
-}
-
-/**
- * Send a plain-text message to a Feishu custom-bot webhook.
- * @param webhook - the bot's webhook URL.
- * @param secret - optional signing secret (used when the bot requires signing).
- * @param text - the message text.
- */
-async function sendFeishu(webhook, secret, text) {
-  const body = { msg_type: "text", content: { text } };
-  if (secret) {
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    const sign = await hmacSha256Base64(`${timestamp}\n${secret}`, secret);
-    body.timestamp = timestamp;
-    body.sign = sign;
-  }
-  const response = await fetchWithTimeout(webhook, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  await assertOk(response, "Feishu", webhook);
-}
-
-/**
- * Send a plain-text message to a WeCom (WeChat Work) group-bot webhook.
- * @param webhook - the bot's webhook URL.
- * @param text - the message text.
- */
-async function sendWecom(webhook, text) {
-  const response = await fetchWithTimeout(webhook, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ msgtype: "text", text: { content: text } }),
-  });
-  await assertOk(response, "WeCom", webhook);
-}
-
-/**
- * Send a plain-text message to a DingTalk custom-bot webhook.
- * @param webhook - the bot's webhook URL (without query string).
- * @param secret - optional signing secret (used when the bot requires signing).
- * @param text - the message text.
- */
-async function sendDingTalk(webhook, secret, text) {
-  let url = webhook;
-  if (secret) {
-    const timestamp = Date.now();
-    const sign = await hmacSha256Base64(`${timestamp}\n${secret}`, secret);
-    const separator = webhook.includes("?") ? "&" : "?";
-    url = `${webhook}${separator}timestamp=${timestamp}&sign=${encodeURIComponent(sign)}`;
-  }
-  const response = await fetchWithTimeout(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ msgtype: "text", text: { content: text } }),
-  });
-  await assertOk(response, "DingTalk", url);
-}
-
-/**
- * Send a message via ServerChan (WeChat push).
- * @param sendKey - the ServerChan Turbo send key.
- * @param title - the push title.
- * @param desp - the push body (Markdown).
- * @param baseUrl - optional API base (defaults to the official endpoint).
- */
-async function sendServerChan(sendKey, title, desp, baseUrl) {
-  const url = `${baseUrl ?? "https://sctapi.ftqq.com"}/${encodeURIComponent(sendKey)}.send`;
-  const response = await fetchWithTimeout(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ title, desp }),
-  });
-  await assertOk(response, "ServerChan", url);
-}
-
-/** Resolve an SMTP config entry, validating required fields. */
-function resolveSmtp(config, env) {
-  if (!config || typeof config !== "object") return undefined;
-  const expand = (value) => {
-    if (typeof value !== "string") return value;
-    const match = /^\$ENV:([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
-    return match ? env[match[1]] : value;
-  };
-  const host = expand(config.host);
-  const user = expand(config.user);
-  const pass = expand(config.pass);
-  // 区分「没配置」和「配置了但环境变量没解析出来」，给出可操作的错误提示。
-  if (!host) return { error: "smtp 未配置 host（例如 smtp.feishu.cn）" };
-  if (!user) return { error: "smtp 未配置 user（发信账号）" };
-  if (!pass) {
-    const rawPass = config.pass;
-    const envRef = typeof rawPass === "string" && /^\$ENV:([A-Za-z_][A-Za-z0-9_]*)$/.exec(rawPass);
-    return {
-      error: envRef
-        ? `环境变量 ${envRef[1]} 未设置或为空 —— 请先运行: [Environment]::SetEnvironmentVariable("${envRef[1]}", "你的专用密码", "User") 并重启 DSH`
-        : "smtp 未配置 pass（专用密码/授权码）",
-    };
-  }
-  const from = expand(config.from) ?? user;
-  const fromName = expand(config.fromName);
+function buildUserMessage(text, pluginName = name) {
   return {
-    host,
-    port: config.port ?? (config.secure === false ? 587 : 465),
-    secure: config.secure ?? true,
-    user,
-    pass,
-    from,
-    fromName,
-    fromHeader: fromName ? `${fromName} <${from}>` : from,
-    to: (Array.isArray(config.to) ? config.to : [config.to]).map(expand).filter(Boolean),
-    ...config.rejectUnauthorized !== undefined ? { rejectUnauthorized: config.rejectUnauthorized } : {},
-    ...config.retries !== undefined ? { retries: config.retries } : {},
+    id: randomUUID(),
+    role: "user",
+    content: [{ type: "text", text }],
+    source: { kind: pluginName ? `plugin:${pluginName}` : "user" },
   };
 }
 
-/** Cache for the Windows registry fallback of `$ENV:` references. */
-const registryEnvCache = new Map();
-
-/**
- * Read one user environment variable from the Windows registry.
- *
- * Why: a variable created after the desktop app started is absent from the
- * app's process environment (`launch environment` snapshot), so a `$ENV:`
- * reference would silently resolve to nothing and the channel would look
- * "not configured". Querying `HKCU\Environment` finds it without a restart.
- */
-function readUserEnvVar(name) {
-  if (registryEnvCache.has(name)) return registryEnvCache.get(name);
-  let value;
-  if (process.platform === "win32") {
-    try {
-      const { execFileSync } = nodeRequire("node:child_process");
-      const out = execFileSync("reg", ["query", "HKCU\\Environment", "/v", name], {
-        encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "ignore"],
-      });
-      const line = out.split(/\r?\n/).find((l) => l.includes("REG_SZ") || l.includes("REG_EXPAND_SZ"));
-      if (line) {
-        value = line.replace(/^\s*\S+\s+REG_(?:EXPAND_)?SZ\s+/, "").trim();
-        if (!value) value = undefined;
-      }
-    } catch {
-      value = undefined;
-    }
-  }
-  registryEnvCache.set(name, value);
-  return value;
-}
-
-/** Expand a `$ENV:NAME` reference against the given environment (registry fallback on Windows). */
-function expandEnv(value, env) {
-  if (typeof value !== "string") return value;
-  const match = /^\$ENV:([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
-  if (!match) return value;
-  const fromEnv = env?.[match[1]];
-  if (typeof fromEnv === "string" && fromEnv.length > 0) return fromEnv;
-  return readUserEnvVar(match[1]);
-}
-
-/**
- * Resolve one channel entry from plugin config, or undefined when not
- * configured. `serverchan` requires `sendKey`; webhook channels require
- * `webhook`; `smtp` requires host/user/pass.
- */
-function resolveChannel(config, channelName, env) {
-  if (!config || typeof config !== "object") return undefined;
-  const entry = channelName === "feishu_bot" ? config.feishuBot : config[channelName];
-  if (!entry || typeof entry !== "object") return undefined;
-  if (channelName === "smtp") {
-    return resolveSmtp(entry, env);
-  }
-  if (channelName === "serverchan") {
-    const sendKey = expandEnv(entry.sendKey, env);
-    return sendKey ? { sendKey, baseUrl: expandEnv(entry.baseUrl, env) } : undefined;
-  }
-  if (channelName === "feishu_bot") {
-    const appId = expandEnv(entry.appId, env);
-    const appSecret = expandEnv(entry.appSecret, env);
-    const receiveId = expandEnv(entry.receiveId, env);
-    if (!appId || !appSecret || !receiveId) {
-      return { error: "feishu_bot 未配置完整（需要 appId/appSecret/receiveId，均可用 $ENV: 引用）" };
-    }
-    return {
-      appId,
-      appSecret,
-      receiveId,
-      receiveIdType: entry.receiveIdType ?? "chat_id",
-      targetSession: expandEnv(entry.targetSession, env) || undefined,
-    };
-  }
-  if (channelName === "qq") {
-    const qq = expandEnv(entry.qq, env);
-    const groupId = expandEnv(entry.groupId, env);
-    if (!qq && !groupId) {
-      return { error: "qq 未配置完整（需要 qq 私聊号或 groupId 群号）" };
-    }
-    return {
-      httpBase: expandEnv(entry.httpBase, env) || undefined,
-      accessToken: expandEnv(entry.accessToken, env) || undefined,
-      qq,
-      groupId,
-      wsPort: entry.wsPort ?? 3001,
-      targetSession: expandEnv(entry.targetSession, env) || undefined,
-    };
-  }
-  const webhook = expandEnv(entry.webhook, env);
-  if (!webhook) return undefined;
-  return { webhook, secret: expandEnv(entry.secret, env) };
-}
-
-/** Whether a resolved channel entry is a config-error placeholder. */
-function isConfigError(entry) {
-  return entry !== undefined && entry !== null && typeof entry === "object" && typeof entry.error === "string";
-}
-
-/** HMAC-SHA256 → base64 (shared by Feishu and DingTalk signing). */
-function hmacSha256Base64(data, secret) {
-  return Promise.resolve().then(() => createHmac("sha256", secret).update(data).digest("base64"));
-}
-
-/**
- * Build the level tag prefix and the final titled text.
- */
-function formatTitle(title, level) {
-  const tag = { info: "[信息]", success: "[完成]", warning: "[警告]", error: "[错误]" }[level];
-  return tag ? `${tag} ${title}` : title;
-}
-
-/**
- * Run one send attempt; resolves the outcome, never throws.
- * @param reply - optional { id, hint } — when set, the SMTP subject carries
- *   the decision tag and the body gains a "reply to command" hint.
- */
-async function trySend(channel, config, title, message, env, reply, extra) {
-  const entry = resolveChannel(config, channel, env);
+/** Read one JSON file, returning undefined when it is absent or malformed. */
+async function readJson(path) {
   try {
-    switch (channel) {
-      case "serverchan": {
-        if (!entry) throw new Error("Server酱渠道未配置（缺少 sendKey）");
-        await sendServerChan(entry.sendKey, title, message, entry.baseUrl);
-        return { channel, ok: true, detail: "sent" };
-      }
-      case "feishu": {
-        if (!entry) throw new Error("飞书渠道未配置（缺少 webhook）");
-        await sendFeishu(entry.webhook, entry.secret, message);
-        return { channel, ok: true, detail: "sent" };
-      }
-      case "feishu_bot": {
-        if (!entry) throw new Error("飞书开放平台渠道未配置");
-        if (isConfigError(entry)) throw new Error(entry.error);
-        const token = await getTenantToken(entry.appId, entry.appSecret);
-        const text = reply ? `${title}\n\n${message}\n\n[决策编号 ${reply.id}] 回复本消息可直接给 agent 下达下一步指令。` : `${title}\n\n${message}`;
-        await sendText(token, entry.receiveId, entry.receiveIdType, text);
-        return { channel, ok: true, detail: "sent via open platform" };
-      }
-      case "qq": {
-        if (!entry) throw new Error("QQ 渠道未配置");
-        if (isConfigError(entry)) throw new Error(entry.error);
-        // 优先用调用时指定的群号（群友模式回原群），否则用配置的 groupId/qq
-        const groupId = extra?.groupId ?? entry.groupId;
-        const target = groupId ? { groupId } : { qq: entry.qq };
-        const text = reply ? `${title}\n\n${message}\n\n[决策编号 ${reply.id}] 回复本消息可直接给 agent 下达下一步指令。` : `${title}\n\n${message}`;
-        await sendQQ(entry, target, text);
-        return { channel, ok: true, detail: groupId ? `sent to group ${groupId}` : `sent to ${entry.qq}` };
-      }
-      case "wecom": {
-        if (!entry) throw new Error("企业微信渠道未配置（缺少 webhook）");
-        await sendWecom(entry.webhook, message);
-        return { channel, ok: true, detail: "sent" };
-      }
-      case "dingtalk": {
-        if (!entry) throw new Error("钉钉渠道未配置（缺少 webhook）");
-        await sendDingTalk(entry.webhook, entry.secret, message);
-        return { channel, ok: true, detail: "sent" };
-      }
-      case "smtp": {
-        if (!entry) throw new Error("邮件渠道未配置");
-        if (isConfigError(entry)) throw new Error(entry.error);
-        const finalTitle = reply ? `${decisionTag(reply.id)} ${title}` : title;
-        const finalMessage = reply
-          ? `${message}\n\n---\n回复此邮件可直接给 agent 下达下一步指令（决策编号 ${reply.id}）。回复内容会作为你的指令自动回到会话中。`
-          : message;
-        await sendEmail(entry, finalTitle, finalMessage);
-        return { channel, ok: true, detail: `sent to ${entry.to.join(", ")}` };
-      }
-      default:
-        throw new Error(`未知渠道 ${JSON.stringify(channel)}`);
-    }
-  } catch (error) {
-    return { channel, ok: false, detail: error instanceof Error ? error.message : String(error) };
+    return JSON.parse(await readFile(path, "utf8"));
+  } catch {
+    return undefined;
   }
 }
 
-/** Build the list of channels to send to for this call. */
-function targetChannels(channelArg, config, env) {
-  const configured = [];
-  for (const candidate of ["serverchan", "feishu", "feishu_bot", "qq", "wecom", "dingtalk", "smtp"]) {
-    if (resolveChannel(config, candidate, env) !== undefined) configured.push(candidate);
+/**
+ * 飞书已处理消息表（跨重启去重）。
+ * 长连接重连时飞书会重投事件，没有这张表就会把同一条指令执行两遍。
+ */
+class SeenStore {
+  constructor() {
+    this.file = join(dshHome(), "logs", "feishu-seen.json");
+    this.map = new Map();
+    this.saveTimer = undefined;
   }
-  if (channelArg === "all") return configured;
-  if (channelArg !== undefined) {
-    if (!["serverchan", "feishu", "feishu_bot", "qq", "wecom", "dingtalk", "smtp"].includes(channelArg)) {
-      throw new Error(`无效的渠道 ${JSON.stringify(channelArg)}（可选：all/serverchan/feishu/feishu_bot/wecom/dingtalk/smtp）`);
-    }
-    return configured.includes(channelArg) ? [channelArg] : [];
+
+  async load() {
+    const raw = await readJson(this.file);
+    for (const [id, time] of Object.entries(raw?.seen ?? {})) this.map.set(id, Number(time) || 0);
+    this.prune();
+    return this.map.size;
   }
-  // Default: the configured default channel, else every configured channel.
-  const defaultChannel = config?.defaultChannel;
-  if (typeof defaultChannel === "string" && defaultChannel !== "all" && configured.includes(defaultChannel)) {
-    return [defaultChannel];
+
+  has(id) {
+    return this.map.has(id);
   }
-  return configured;
+
+  add(id, time) {
+    if (!id) return;
+    this.map.set(id, Number(time) || Date.now());
+    this.prune();
+    this.scheduleSave();
+  }
+
+  /** Keep the newest 500 entries; older ones are unlikely to be redelivered. */
+  prune() {
+    if (this.map.size <= 500) return;
+    const entries = [...this.map.entries()].sort((a, b) => b[1] - a[1]).slice(0, 500);
+    this.map = new Map(entries);
+  }
+
+  scheduleSave() {
+    if (this.saveTimer !== undefined) return;
+    this.saveTimer = setTimeout(async () => {
+      this.saveTimer = undefined;
+      try {
+        const { mkdir: mkdirFs, writeFile } = await import("node:fs/promises");
+        await mkdirFs(dirname(this.file), { recursive: true });
+        await writeFile(this.file, JSON.stringify({
+          seen: Object.fromEntries([...this.map.entries()].sort((a, b) => b[1] - a[1]).slice(0, 500)),
+          savedAt: new Date().toISOString(),
+        }), "utf8");
+      } catch {
+        // 落盘失败只影响跨重启去重
+      }
+    }, 400);
+    this.saveTimer.unref?.();
+  }
 }
 
-/** Plugin config schema. Optional object fields: all fields are optional by default. */
+/** Plugin config schema. Every field is optional; defaults fill the gaps. */
 const Config = z.object({
   defaultChannel: z.string().default(""),
+
   serverchan: z.object({ sendKey: z.string(), baseUrl: z.string() }),
   feishu: z.object({ webhook: z.string(), secret: z.string() }),
   feishuBot: z.object({
@@ -501,17 +166,25 @@ const Config = z.object({
     receiveId: z.string(),
     receiveIdType: z.string(),
     targetSession: z.string().default(""),
+    /** 是否允许机器人回复来源会话（私聊/群）。 */
+    replyToSource: z.boolean(),
+    /** 接受哪些会话类型：p2p,group。 */
+    chatTypes: z.string(),
   }),
   wecom: z.object({ webhook: z.string() }),
   dingtalk: z.object({ webhook: z.string(), secret: z.string() }),
+
   qq: z.object({
     httpBase: z.string(),
     accessToken: z.string(),
-    qq: z.string(),            // 私聊目标 QQ 号
-    groupId: z.string(),       // 群聊目标群号（可选）
-    wsPort: z.number(),        // 接收端反向 WS 端口
-    targetSession: z.string().default(""), // 可选：QQ 消息注入哪个 DSH 会话
+    qq: z.string(),
+    groupId: z.string(),
+    wsHost: z.string(),
+    wsPort: z.number(),
+    port: z.number(),
+    targetSession: z.string().default(""),
   }),
+
   smtp: z.object({
     host: z.string(),
     port: z.number(),
@@ -523,7 +196,7 @@ const Config = z.object({
     fromName: z.string(),
     to: z.union([z.string(), z.array(z.string())]),
   }),
-  // 收件配置：用于「ask_user_email」轮询用户对邮件的回复。
+
   imap: z.object({
     host: z.string(),
     port: z.number(),
@@ -532,135 +205,218 @@ const Config = z.object({
     pass: z.string(),
     mailbox: z.string(),
     rejectUnauthorized: z.boolean(),
+    maxMessages: z.number(),
   }),
   pollIntervalMs: z.number(),
-  // 定时汇报总开关：默认 false（关闭）。设为 true 且配置了 reports 才启用。
+
+  /** 定时汇报总开关（默认关闭）。 */
   enableReports: z.boolean().default(false),
-  // 定时汇报：{ name, channel, schedule, text } 数组。
-  // schedule 格式："daily:HH:MM"（每日定点）或 "every:N"（每 N 分钟，N>=5）。
+  /** [{ name, channel, schedule: "daily:HH:MM" | "every:N" | "at:HH:MM,HH:MM", text }] */
   reports: z.array(z.object({
     name: z.string(),
     channel: z.string(),
     schedule: z.string(),
     text: z.string(),
   })),
-  // 访问控制（黑白名单）：mode=whitelist 时仅 allowedUsers 可注入指令，
-  // readOnlyUsers 只读；其他用户消息不注入。mode=open（默认）全部放行。
+
+  /** 访问控制：mode=whitelist 时仅 allowedUsers 可注入；readOnlyUsers 只读。 */
   accessControl: z.object({
     mode: z.string(),
-    allowedUsers: z.object({
-      feishu: z.array(z.string()),
-      qq: z.array(z.string()),
-    }),
-    readOnlyUsers: z.object({
-      feishu: z.array(z.string()),
-      qq: z.array(z.string()),
-    }),
+    allowedUsers: z.object({ feishu: z.array(z.string()), qq: z.array(z.string()) }),
+    readOnlyUsers: z.object({ feishu: z.array(z.string()), qq: z.array(z.string()) }),
   }),
+
+  /** 外部消息注入时是否附带「回执到原渠道」的提示（默认开）。 */
+  replyHint: z.boolean().default(true),
+  /** 单条外部消息注入前的最大字符数（超出截断，避免撑爆上下文）。 */
+  maxInboundChars: z.number().default(4000),
 });
 
-/** Resolve the IMAP config (same $ENV: expansion as SMTP). */
-function resolveImap(config, env) {
-  if (!config?.imap) return undefined;
-  const expand = (value) => {
-    if (typeof value !== "string") return value;
-    const match = /^\$ENV:([A-Za-z_][A-Za-z0-9_]*)$/.exec(value);
-    return match ? env[match[1]] : value;
-  };
-  const imap = config.imap;
-  const host = expand(imap.host);
-  const user = expand(imap.user);
-  const pass = expand(imap.pass);
-  if (!host || !user || !pass) return undefined;
-  return {
-    host,
-    port: imap.port ?? 993,
-    secure: imap.secure ?? true,
-    user,
-    pass,
-    mailbox: imap.mailbox ?? "INBOX",
-    rejectUnauthorized: imap.rejectUnauthorized ?? true,
-  };
+/** Tool parameters of `notify`. */
+const NOTIFY_PARAMETERS = {
+  title: { type: "string", required: true, description: "通知标题，例如「任务完成」或「构建失败」。" },
+  message: { type: "string", required: true, description: "通知正文（纯文本）。过长时按渠道上限自动分条发送。" },
+  channel: {
+    type: "string",
+    description:
+      "发送渠道：feishu_bot（飞书开放平台，推荐）、qq（QQ/NapCat）、smtp（邮箱）、serverchan（微信）、"
+      + "feishu（飞书群 webhook）、wecom（企业微信）、dingtalk（钉钉）。"
+      + "不填用默认渠道；填 all 发到所有已配置渠道。未配置的渠道会被跳过。",
+    enum: ["all", "serverchan", "feishu", "feishu_bot", "qq", "wecom", "dingtalk", "smtp"],
+  },
+  level: {
+    type: "string",
+    description: "可选级别，会在标题前加标签：[信息]/[完成]/[警告]/[错误]。",
+    enum: ["info", "success", "warning", "error"],
+  },
+  awaitReply: {
+    type: "boolean",
+    description: "设为 true 时邮件通知带决策编号，用户直接回信即可给 agent 下达下一步指令（需配置 imap）。",
+  },
+  groupId: { type: "string", description: "仅 QQ：要发往的群号；群友模式回原群时填被 @ 的群号。" },
+  to: {
+    type: "string",
+    description:
+      "可选目标 id，覆盖配置里的默认接收方。飞书填 chat_id（oc_…）或 open_id（ou_…）；QQ 填号码；邮件填地址。"
+      + "用于把结果发回消息来源会话。",
+  },
+};
+
+/** Tool parameters of `ask_user_email`. */
+const ASK_PARAMETERS = {
+  question: { type: "string", required: true, description: "要问用户的问题。" },
+  context: { type: "string", description: "可选背景，帮助用户决策。" },
+  options: { type: "array", description: "可选建议项，用户可直接回复其中一个。", items: { type: "string" } },
+};
+
+/** Common `{ ok, detail }` output used by the config/mode tools. */
+const OK_OUTPUT = {
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: { ok: { type: "boolean", required: true }, detail: { type: "string", required: true } },
+  },
+  render: (_args, value) => [{ type: "text", text: value.detail }],
+};
+
+/** Resolve a dotted path against an object. */
+function getByPath(object, path) {
+  return String(path).split(".").reduce((value, key) => (value === undefined || value === null ? undefined : value[key]), object);
 }
 
+/** Set a dotted path on a mutable object, creating intermediate objects. */
+function setByPath(object, path, value) {
+  const keys = String(path).split(".");
+  let cursor = object;
+  for (const key of keys.slice(0, -1)) {
+    if (cursor[key] === undefined || cursor[key] === null || typeof cursor[key] !== "object") cursor[key] = {};
+    cursor = cursor[key];
+  }
+  cursor[keys[keys.length - 1]] = value;
+  return object;
+}
+
+/** Delete a dotted path (used by `unset`). */
+function deleteByPath(object, path) {
+  const keys = String(path).split(".");
+  const parent = keys.slice(0, -1).reduce((value, key) => (value === undefined || value === null ? undefined : value[key]), object);
+  if (parent && typeof parent === "object") delete parent[keys[keys.length - 1]];
+  return object;
+}
+
+/**
+ * Parse a string argument into a typed value.
+ * Accepts booleans, numbers, quoted strings, JSON arrays/objects, and comma lists.
+ */
+function parseValue(raw) {
+  const text = String(raw ?? "").trim();
+  if (text === "true") return true;
+  if (text === "false") return false;
+  if (text === "null") return null;
+  if (/^-?\d+(\.\d+)?$/.test(text)) return Number(text);
+  if (/^["'].*["']$/.test(text)) return text.slice(1, -1);
+  if (/^[[{]/.test(text)) {
+    try {
+      return JSON.parse(text.replace(/'/g, '"'));
+    } catch {
+      // fall through to string
+    }
+  }
+  return text;
+}
+
+/** Whether a resolved value is a ready-to-use channel entry. */
+function usable(entry) {
+  return entry !== undefined && !isConfigError(entry);
+}
+
+/**
+ * Attach the plugin.
+ * @param ctx - Cordis context owning `tools` and `timer`.
+ * @param config - raw plugin config from the loader.
+ */
 function apply(ctx, config) {
   const resolved = config ?? {};
   const env = process.env;
-  const imapConfig = resolveImap(resolved, env);
-  const pollIntervalMs = resolved.pollIntervalMs ?? 60000;
-  const feishuBotConfig = resolveChannel(resolved, "feishu_bot", env);
-  const qqConfig = resolveChannel(resolved, "qq", env);
 
-  // 迁移旧的群友记忆（friendmode/memory.jsonl → memory/friend/）
-  migrateLegacyFriendMemory().then((n) => {
-    if (n > 0) console.log(`[dsh-whale-notify] 已迁移 ${n} 个群友记忆文件到统一记忆库`);
-  }).catch(() => {});
+  // ────────────────────────── 配置快照 ──────────────────────────
+  const imapEntry = resolveImap(resolved, env);
+  const imapConfig = usable(imapEntry) ? imapEntry : undefined;
+  const imapProblem = isConfigError(imapEntry) ? imapEntry.error : undefined;
+  const feishuBotEntry = resolveChannel(resolved, "feishu_bot", env);
+  const feishuBotConfig = usable(feishuBotEntry) ? feishuBotEntry : undefined;
+  const qqEntry = resolveChannel(resolved, "qq", env);
+  const qqConfig = usable(qqEntry) ? qqEntry : undefined;
+  const acl = resolveAccessControl(resolved, env);
+  const pollIntervalMs = Number(resolved.pollIntervalMs ?? 60000);
+  const replyHint = resolved.replyHint !== false;
+  const maxInboundChars = Number(resolved.maxInboundChars ?? 4000);
 
-  // ── 访问控制（黑白名单）──
-  // accessControl: { mode: "whitelist"|"open", allowedUsers: { feishu:[], qq:[] }, readOnlyUsers: { feishu:[], qq:[] } }
-  // whitelist 模式：仅 allowedUsers 可注入指令；readOnlyUsers 可注入但标记只读；
-  // 其他用户消息不注入（无反应），仅记日志。open 模式：全部放行（默认）。
-  const accessControl = resolved.accessControl ?? {};
-  const acMode = accessControl.mode ?? "open";
-  const isAllowed = (channel, from) => {
-    if (acMode !== "whitelist") return { allowed: true, readOnly: false };
-    if (!from) return { allowed: false, readOnly: false };
-    const allowed = accessControl.allowedUsers?.[channel] ?? [];
-    const readOnly = accessControl.readOnlyUsers?.[channel] ?? [];
-    if (allowed.includes(from)) return { allowed: true, readOnly: false };
-    if (readOnly.includes(from)) return { allowed: true, readOnly: true };
-    return { allowed: false, readOnly: false };
+  /** Runtime state surfaced by `whale_check`. */
+  const state = {
+    feishu: { status: "off", since: undefined, lastError: undefined, events: 0, restarts: 0, lastEventAt: undefined },
+    qq: { status: "off", lastError: undefined, connections: 0, lastEventAt: undefined },
+    injected: 0,
+    denied: 0,
+    lastInjection: undefined,
   };
 
+  ctx.effect(() => () => {
+    // 停插件时把环境缓存清掉，热重载后能读到最新变量
+    clearEnvCache();
+  }, "dsh-whale-notify cleanup");
+
+  // 迁移旧的群友记忆（friendmode/memory.jsonl → memory/friend/）
+  migrateLegacyFriendMemory().then((count) => {
+    if (count > 0) console.log(`[dsh-whale-notify] 已迁移 ${count} 个群友记忆文件到统一记忆库`);
+  }).catch(() => {});
+
+  // ────────────────────────── 会话定位 ──────────────────────────
   /**
-   * 会话优先序（用于把外部消息注入到「最可能是用户正在看的那个会话」）。
+   * 选一个最可能是「用户正在看」的会话。
    *
-   * 实测坑：`session.header.updatedAt` 会被标题生成等后台动作刷新，
-   * 跟"用户真实在聊哪个会话"不是一回事；而 agent 的 `session.events` 在
-   * 部分路径下是稀疏的，导致排序把旧会话排到前面。
-   * 内核 `sessionQuery.listSessions()` 给的是**确定性的 newest-first** 语料，
-   * 所以优先用它；拿不到再退回 header 时间戳。另外记住"上次注入到哪个会话"，
-   * 只要它还活着就继续用它（连续对话不会被抢走）。
+   * 优先级：显式 targetSession → 上次注入的会话（连续对话不被打断）→
+   * sessionQuery 的 newest-first 语料 → agent 活跃时间 → 首个根会话。
+   *
+   * 子会话（subagent）不参与自动选择：把外部指令灌进子代理会毁掉它的任务；
+   * 但显式 targetSession 指向子会话时仍然照办。
    */
   let lastInjectedSession;
   const sessionOrderCache = { at: 0, ids: [] };
+
+  const isSubagent = (agent) => agent?.session?.header?.origin === "subagent";
+
   const preferredSessionIds = async () => {
     const now = Date.now();
-    if (now - sessionOrderCache.at < 10000) return sessionOrderCache.ids;
+    if (now - sessionOrderCache.at < 10_000) return sessionOrderCache.ids;
     const query = ctx.get("sessionQuery");
     if (!query || typeof query.listSessions !== "function") return sessionOrderCache.ids;
     try {
       const records = await query.listSessions();
       sessionOrderCache.ids = (records ?? [])
-        .filter((r) => r?.live === true)
-        .map((r) => r?.header?.id)
+        .filter((record) => record?.live === true)
+        .map((record) => record?.header?.id)
         .filter((id) => typeof id === "string");
       sessionOrderCache.at = now;
     } catch {
-      /* 查询失败就用上一次的顺序 */
+      // 查询失败沿用上一次的顺序
     }
     return sessionOrderCache.ids;
   };
 
-  /** 取一个 agent 的「最后活跃时间」，兼容不同版本的 session 结构。 */
+  /** 一个 agent 的「最后活跃时间」，兼容不同版本的 session 结构。 */
   const agentLastActive = (agent) => {
-    const events = agent?.session?.events;
-    if (Array.isArray(events) && events.length > 0) {
-      const last = events[events.length - 1];
-      if (typeof last?.time === "number") return last.time;
-    }
-    const header = agent?.session?.header;
-    const stamp = header?.updatedAt ?? header?.createdAt;
+    const stamp = agent?.session?.header?.updatedAt ?? agent?.session?.header?.createdAt;
+    if (typeof stamp === "number") return stamp;
     if (typeof stamp === "string") {
       const parsed = Date.parse(stamp);
       if (!Number.isNaN(parsed)) return parsed;
     }
-    if (typeof stamp === "number") return stamp;
     if (typeof agent?.lastActivity === "number") return agent.lastActivity;
     return 0;
   };
 
-  /** 把目标 agent 解析成真正能接收消息的 Agent 对象（兼容 handle / agent 两种形态）。 */
+  /** 把 handle / agent 两种形态统一成能收消息的 Agent。 */
   const unwrapAgent = (value) => {
     if (!value) return undefined;
     if (typeof value.followup === "function") return value;
@@ -668,297 +424,349 @@ function apply(ctx, config) {
     return undefined;
   };
 
-  /**
-   * 注入一条用户消息到目标 agent（配置指定 session，否则自动选最近活跃会话）。
-   *
-   * 这条路径曾经是「静默失败」的重灾区：任何一步不满足就 return，日志里什么都看不到。
-   * 现在每个失败分支都会落一条 notify.log，方便定位「飞书发消息没反应」。
-   */
-  const injectToAgent = async (agents, targetSession, text, logKind, from, opts = {}) => {
-    const fail = (reason) => {
-      appendLog({ ts: new Date().toISOString(), kind: `${logKind}_failed`, from, reason, ...opts.control ? { control: true } : {} }).catch(() => {});
-      console.warn(`[dsh-whale-notify] 消息未能注入会话（${reason}）`);
-    };
-    if (!agents || typeof agents.list !== "function") {
-      fail("agents 服务不可用");
-      return false;
-    }
-    // opts.control=true：允许操控（用户主动申请），不受白名单限制
-    const control = opts.control === true;
-    const live = agents.list()
-      .map((entry) => ({ agent: unwrapAgent(entry), entry }))
-      .filter((x) => x.agent !== undefined);
-    const idOf = (x) => x.agent?.id ?? x.entry?.session?.header?.id;
+  /** All live agents with a usable followup(), subagents flagged. */
+  const liveAgents = () => {
+    const agents = ctx.get("agents");
+    if (!agents || typeof agents.list !== "function") return [];
+    return agents.list()
+      .map((entry) => {
+        const agent = unwrapAgent(entry);
+        return agent ? { agent, id: agent.id ?? entry?.session?.header?.id } : undefined;
+      })
+      .filter(Boolean);
+  };
 
-    let target;
+  /**
+   * Pick the target agent for an external message.
+   * @returns { agent, id } or undefined.
+   */
+  const pickTarget = async (targetSession) => {
+    const live = liveAgents();
+    if (live.length === 0) return undefined;
+    const byId = (id) => live.find((row) => row.id === id);
+
     if (targetSession) {
-      target = live.find((x) => idOf(x) === targetSession)?.agent;
-      if (!target) fail(`配置的 targetSession "${targetSession}" 当前没有存活会话（会话未打开或已关闭）`);
+      const explicit = byId(targetSession);
+      if (explicit) return explicit;
+      // 配置的会话不在线：继续走自动选择，但日志里记一笔
+      appendLog({ kind: "inject_target_missing", targetSession }).catch(() => {});
     }
-    if (!target && lastInjectedSession) {
-      target = live.find((x) => idOf(x) === lastInjectedSession)?.agent;   // 粘住上次注入的会话
+    const sticky = lastInjectedSession ? byId(lastInjectedSession) : undefined;
+    if (sticky) return sticky;
+
+    const order = await preferredSessionIds();
+    for (const id of order) {
+      const hit = byId(id);
+      if (hit && !isSubagent(hit.agent)) return hit;
     }
+    const roots = live.filter((row) => !isSubagent(row.agent));
+    const pool = roots.length > 0 ? roots : live;
+    pool.sort((a, b) => agentLastActive(b.agent) - agentLastActive(a.agent));
+    return pool[0];
+  };
+
+  /**
+   * Inject one user message into the chosen session.
+   * @returns { ok, sessionId?, reason? }
+   */
+  const injectToAgent = async (text, { targetSession, kind, from, readOnly = false, meta = {} } = {}) => {
+    const target = await pickTarget(targetSession);
     if (!target) {
-      // ① 内核 sessionQuery 的 newest-first 顺序（最可靠）
-      const order = await preferredSessionIds();
-      for (const id of order) {
-        const hit = live.find((x) => idOf(x) === id);
-        if (hit) { target = hit.agent; break; }
-      }
+      await appendLog({ kind: `${kind}_failed`, from, reason: "当前没有任何存活的 agent 会话", ...meta });
+      return { ok: false, reason: "当前没有任何存活的 agent 会话（客户端里要开着一个会话）" };
     }
-    if (!target) {
-      // ② 退回 agent 的活跃时间排序
-      target = live.slice().sort((x, y) => agentLastActive(y.agent) - agentLastActive(x.agent))[0]?.agent;
-    }
-    if (!target) {
-      fail("当前没有任何存活的 agent 会话");
-      return false;
-    }
-    const finalText = opts.readOnly
+    const body = readOnly
       ? `[只读消息] ${text}\n\n（此消息来自只读用户，仅作参考，不要执行任何修改性操作。）`
       : text;
     try {
-      target.followup(buildUserMessage(finalText, name));
-      const sessionId = target.id ?? target.session?.header?.id;
-      lastInjectedSession = sessionId;
-      appendLog({
-        ts: new Date().toISOString(), kind: logKind, from, text,
-        session: sessionId,
-        ...opts.readOnly ? { readOnly: true } : {},
-        ...control ? { control: true } : {},
-      }).catch(() => {});
-      return true;
+      target.agent.followup(buildUserMessage(body));
+      lastInjectedSession = target.id;
+      state.injected += 1;
+      state.lastInjection = { at: new Date().toISOString(), session: target.id, kind, from };
+      await appendLog({
+        kind, from, session: target.id, chars: body.length,
+        ...(readOnly ? { readOnly: true } : {}),
+        ...meta,
+        text: body.slice(0, 500),
+      });
+      return { ok: true, sessionId: target.id };
     } catch (error) {
-      fail(`followup 抛错：${error instanceof Error ? error.message : String(error)}`);
-      return false;
+      const reason = error instanceof Error ? error.message : String(error);
+      await appendLog({ kind: `${kind}_failed`, from, session: target.id, reason, ...meta });
+      return { ok: false, reason };
     }
   };
 
-  // 邮件回复轮询：有 imap 配置且有 pending 决策时才真正连接（间隔轮询）。
-  // timer 已通过 inject 声明（host 层 dsh-base 提供），这里直接可用。
+  /** Truncate an inbound message so one long paste cannot flood the context. */
+  const clampInbound = (text) => (text.length > maxInboundChars
+    ? `${text.slice(0, maxInboundChars)}\n…（消息过长，已截断 ${text.length - maxInboundChars} 字）`
+    : text);
+
+  /** Whether the sender is allowed to drive this session at all. */
+  const checkAccess = async (channel, from, kind, text) => {
+    const verdict = acl.check(channel, from);
+    if (!verdict.allowed) {
+      state.denied += 1;
+      await appendLog({ kind: `${kind}_denied`, from, text: text.slice(0, 200), mode: acl.mode });
+    }
+    return verdict;
+  };
+
+  // ────────────────────────── 邮件回复轮询 ──────────────────────────
+  // 只有存在待回复决策时才真正连 IMAP（pollAndInject 内部先判空）。
   if (imapConfig) {
+    restorePending((sessionId) => liveAgents().find((row) => row.id === sessionId)?.agent)
+      .then((count) => {
+        if (count > 0) appendLog({ kind: "ask_pending_restored", count }).catch(() => {});
+      })
+      .catch(() => {});
+
     ctx.interval(async () => {
+      if (pendingIds().length === 0) return;
       try {
-        await pollAndInject(imapConfig);
+        const result = await pollAndInject(imapConfig, {
+          resolveAgent: (sessionId) => liveAgents().find((row) => row.id === sessionId)?.agent,
+          log: (record) => appendLog(record).catch(() => {}),
+        });
+        if (result.injected > 0 || result.skipped > 0) {
+          appendLog({ kind: "imap_poll", ...result }).catch(() => {});
+        }
       } catch (error) {
-        console.error("[dsh-whale-notify] imap poll failed:", error instanceof Error ? error.message : String(error));
+        console.error("[dsh-whale-notify] imap 轮询失败:", error instanceof Error ? error.message : String(error));
       }
-    }, pollIntervalMs);
+    }, Math.max(15_000, pollIntervalMs));
   }
 
-  // 飞书开放平台：收消息 → 注入目标 agent 会话。
-  //
-  // 收信只有一条通道：**长连接**（官方 WSClient，实时）。
-  // 需要飞书后台把「事件订阅方式」设为「使用长连接接收事件」并订阅 im.message.receive_v1。
-  //
-  // 历史说明：曾经另有一条"轮询兜底"（调 GET /im/v1/messages 读会话消息），
-  // 用于后台订阅失效时仍能收信；但它带来两个问题——
-  //   ① 会话消息是"读"来的，与长连接并存时容易出现跨重启重放（游标与内存去重表不同步）；
-  //   ② 需要额外的 im:message 读权限与游标文件，复杂度高。
-  // 实测确认长连接工作正常（`feishu_recv … via=ws`）后，按用户要求**移除轮询**。
-  // 若哪天后台订阅又失效：`whale_check` 会显示「长连接 up 但事件数长期为 0」，
-  // 那时再去后台把订阅方式改回长连接即可（比维护第二条收信通道简单）。
-  //
-  // 保留的两个小设施：
-  //   - seen 表（logs/feishu-seen.json）：长连接重连时飞书可能重投事件，靠它去重；
-  //   - 游标（logs/feishu-poll-cursor.json）：只作为「最后收到的消息」诊断信息。
-  /** 飞书长连接状态机（供诊断工具读取）。 */
-  const feishuLink = { state: "off", since: undefined, error: undefined, events: 0 };
-  const feishuPoll = { lastId: undefined, lastAt: undefined, lastTime: 0 };
-  /** 已处理消息表 messageId → 该消息的飞书创建时间（毫秒），落盘用于跨重启去重。 */
-  const seenFeishuMessages = new Map();
-  const seenFile = join(
-    process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? ".", ".dsh"),
-    "logs", "feishu-seen.json",
-  );
-  try {
-    const raw = JSON.parse(readFileSync(seenFile, "utf8"));
-    for (const [id, time] of Object.entries(raw?.seen ?? {})) seenFeishuMessages.set(id, Number(time) || 0);
-  } catch { /* 首次运行没有这个文件 */ }
-  const saveSeen = () => {
-    try {
-      const entries = [...seenFeishuMessages.entries()].sort((a, b) => b[1] - a[1]).slice(0, 500);
-      seenFeishuMessages.clear();
-      for (const [id, t] of entries) seenFeishuMessages.set(id, t);
-      mkdirSync(dirname(seenFile), { recursive: true });
-      writeFileSync(seenFile, JSON.stringify({ seen: Object.fromEntries(entries), savedAt: new Date().toISOString() }), "utf8");
-    } catch { /* 落盘失败不影响收信 */ }
-  };
-  /** 游标文件：记录「最后收到的飞书消息」，供诊断与排障对照。 */
-  const cursorFile = join(
-    process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? ".", ".dsh"),
-    "logs", "feishu-poll-cursor.json",
-  );
-  const saveCursor = () => {
-    try {
-      mkdirSync(dirname(cursorFile), { recursive: true });
-      writeFileSync(cursorFile, JSON.stringify({
-        lastTime: feishuPoll.lastTime, lastId: feishuPoll.lastId, savedAt: new Date().toISOString(),
-      }), "utf8");
-    } catch { /* 落盘失败不影响收信 */ }
-  };
+  // ────────────────────────── 飞书收信（长连接） ──────────────────────────
+  const seen = new SeenStore();
+  seen.load().catch(() => {});
 
-  if (feishuBotConfig && !isConfigError(feishuBotConfig)) {
-    const agents = ctx.get("agents");
-    if (agents && typeof agents.list === "function") {
-      /** 处理一条飞书来消息（长连接唯一入口）：去重 → 访问控制 → 注入会话。 */
-      const handleFeishuMessage = (msg) => {
-        if (!msg?.text) return;
-        const postedAt = Number(msg.createTime) || Date.now();
-        if (msg.messageId) {
-          if (seenFeishuMessages.has(msg.messageId)) return;   // 重连重投/跨重启去重
-          seenFeishuMessages.set(msg.messageId, postedAt);
-          saveSeen();
-        }
-        if (postedAt > feishuPoll.lastTime) {
-          feishuPoll.lastTime = postedAt;
-          feishuPoll.lastId = msg.messageId ?? feishuPoll.lastId;
-          feishuPoll.lastAt = new Date(postedAt).toISOString();
-        }
-        feishuLink.events += 1;
-        appendLog({
-          ts: new Date().toISOString(), kind: "feishu_recv", from: msg.senderId,
-          chatId: msg.chatId, chars: msg.text.length, via: "ws",
-        }).catch(() => {});
-        // 只处理发往配置的目标会话（或用户发给机器人的私聊）
-        if (feishuBotConfig.receiveIdType === "chat_id" && msg.chatId !== feishuBotConfig.receiveId) {
-          appendLog({ ts: new Date().toISOString(), kind: "feishu_ignored", reason: "chat_id 不匹配", chatId: msg.chatId }).catch(() => {});
+  if (feishuBotConfig) {
+    /** 处理一条飞书来消息：去重 → 过滤 → 访问控制 → 注入。 */
+    const handleFeishuMessage = async (msg) => {
+      if (!msg?.text) return;
+      const postedAt = msg.createTime ?? Date.now();
+
+      // 去重：长连接重连时飞书会重投事件
+      if (msg.messageId) {
+        if (seen.has(msg.messageId)) {
+          await appendLog({ kind: "feishu_duplicate", messageId: msg.messageId });
           return;
         }
-        // 访问控制：白名单模式下非授权用户不注入（无反应，仅记日志）
-        const ac = isAllowed("feishu", msg.senderId);
-        if (!ac.allowed) {
-          appendLog({ ts: new Date().toISOString(), kind: "feishu_denied", from: msg.senderId, text: msg.text }).catch(() => {});
-          return;
-        }
-        injectToAgent(agents, feishuBotConfig.targetSession, `飞书消息（来自 ${msg.senderId ?? "用户"}）：${msg.text}\n\n（本条指令来自飞书渠道——任务完成后请通过 notify(channel: "feishu_bot") 把结果发回飞书，让用户知道。）`, "feishu_in", msg.senderId, { readOnly: ac.readOnly }).catch(() => {});
-      };
+        seen.add(msg.messageId, postedAt);
+      }
+      state.feishu.events += 1;
+      state.feishu.lastEventAt = new Date(postedAt).toISOString();
 
-      let stopLongConnection = () => {};
-      appendLog({ ts: new Date().toISOString(), kind: "feishu_link_start", detail: "正在建立飞书长连接" }).catch(() => {});
+      // 机器人自己的消息不处理（事件通常只推别人的，这里防御一下）
+      if (msg.senderType === "app" || msg.senderId === feishuBotConfig.appId) return;
+
+      const chatType = msg.chatType ?? (msg.chatId?.startsWith("oc_") ? "group" : "p2p");
+      if (!feishuBotConfig.chatTypes.includes(chatType)) {
+        await appendLog({ kind: "feishu_ignored", reason: `不接受的会话类型 ${chatType}`, chatId: msg.chatId });
+        return;
+      }
+      // 群聊只在配置的目标会话里响应；私聊（p2p）始终响应 —— 用户可能只是换了入口。
+      if (chatType === "group" && feishuBotConfig.receiveIdType === "chat_id" && msg.chatId !== feishuBotConfig.receiveId) {
+        await appendLog({ kind: "feishu_ignored", reason: "群 chat_id 不在配置范围", chatId: msg.chatId });
+        return;
+      }
+
+      const verdict = await checkAccess("feishu", msg.senderId, "feishu_in", msg.text);
+      if (!verdict.allowed) return;
+
+      const hint = replyHint
+        ? `\n\n（本条指令来自飞书${chatType === "group" ? "群" : "私聊"}渠道，会话 ${msg.chatId}。`
+          + `任务完成后请用 notify(channel: "feishu_bot", to: "${msg.chatId}") 把结果发回这里。`
+          + `纯文本，不要 markdown。）`
+        : "";
+      await injectToAgent(
+        clampInbound(`飞书消息（来自 ${msg.senderId ?? "用户"}）：${msg.text}${hint}`),
+        {
+          targetSession: feishuBotConfig.targetSession,
+          kind: "feishu_in",
+          from: msg.senderId,
+          readOnly: verdict.readOnly,
+          meta: { chatId: msg.chatId, chatType },
+        },
+      );
+    };
+
+    /** 建立长连接；失败时按指数退避重试（SDK 只在连上之后才会自己重连）。 */
+    let stopConnection;
+    let retryTimer;
+    let attempt = 0;
+
+    const start = () => {
+      state.feishu.status = "connecting";
+      appendLog({ kind: "feishu_link_start", attempt }).catch(() => {});
       startLongConnection(feishuBotConfig.appId, feishuBotConfig.appSecret, (payload) => {
         const msg = extractMessageEvent(payload);
-        if (!msg) return;
-        handleFeishuMessage({ ...msg, createTime: msg.createTime ?? Date.now() });
-        saveCursor();   // 记录"最后收到的消息"，供诊断对照
-      }, { log: (...args) => { appendLog({ ts: new Date().toISOString(), kind: "feishu_link", detail: args.map(String).join(" ") }).catch(() => {}); } })
-        .then((stop) => {
-          stopLongConnection = stop;
-          feishuLink.state = "up";
-          feishuLink.since = new Date().toISOString();
-          appendLog({ ts: feishuLink.since, kind: "feishu_link_up" }).catch(() => {});
-        })
-        .catch((error) => {
-          feishuLink.state = "failed";
-          feishuLink.error = error instanceof Error ? error.message : String(error);
-          appendLog({ ts: new Date().toISOString(), kind: "feishu_link_failed", error: feishuLink.error }).catch(() => {});
-          console.error("[dsh-whale-notify] 飞书长连接启动失败:", feishuLink.error);
-        });
-      // 插件停止时断开长连接
-      ctx.effect(() => stopLongConnection);
-    } else {
-      console.warn("[dsh-whale-notify] agents 服务不可用 — 飞书消息注入未启用（仅保留发信）");
-    }
+        if (msg) handleFeishuMessage(msg).catch(() => {});
+      }, {
+        log: (...args) => appendLog({ kind: "feishu_link", detail: args.map(String).join(" ") }).catch(() => {}),
+        onState: (status, error) => {
+          state.feishu.status = status;
+          if (status === "up") {
+            state.feishu.since = new Date().toISOString();
+            state.feishu.lastError = undefined;
+            attempt = 0;
+            appendLog({ kind: "feishu_link_up" }).catch(() => {});
+          } else if (status === "failed") {
+            state.feishu.lastError = error instanceof Error ? error.message : String(error ?? "未知错误");
+            appendLog({ kind: "feishu_link_failed", error: state.feishu.lastError }).catch(() => {});
+            scheduleRetry();
+          }
+        },
+      }).then((stop) => {
+        stopConnection = stop;
+        state.feishu.status = "up";
+        state.feishu.since = new Date().toISOString();
+      }).catch((error) => {
+        state.feishu.status = "failed";
+        state.feishu.lastError = error instanceof Error ? error.message : String(error);
+        appendLog({ kind: "feishu_link_failed", error: state.feishu.lastError }).catch(() => {});
+        console.error("[dsh-whale-notify] 飞书长连接启动失败:", state.feishu.lastError);
+        scheduleRetry();
+      });
+    };
+
+    const scheduleRetry = () => {
+      if (retryTimer !== undefined) return;
+      attempt += 1;
+      if (attempt > 6) {
+        state.feishu.lastError = `${state.feishu.lastError ?? "连接失败"}（已重试 ${attempt - 1} 次，停止重连）`;
+        return;
+      }
+      const delay = Math.min(5_000 * 2 ** (attempt - 1), 300_000);
+      state.feishu.restarts += 1;
+      retryTimer = setTimeout(() => {
+        retryTimer = undefined;
+        try { stopConnection?.(); } catch { /* ignore */ }
+        start();
+      }, delay);
+      retryTimer.unref?.();
+    };
+
+    start();
+    // 注意：这里的 disposer 必须读「最新」的 stopConnection，
+    // 否则插件卸载时拿到的是启动前那个空函数，长连接不会被关掉。
+    ctx.effect(() => () => {
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
+      try { stopConnection?.(); } catch { /* ignore */ }
+    }, "dsh-whale-notify feishu link");
   }
 
-  // QQ（OneBot/NapCat）：接收 QQ 消息 → 注入目标 agent 会话。
-  if (qqConfig && !isConfigError(qqConfig)) {
-    const agents = ctx.get("agents");
+  // ────────────────────────── QQ 收信 ──────────────────────────
+  if (qqConfig) {
     try {
       const stopQQ = startQQReceiver(qqConfig, (msg) => {
-        const label = msg.type === "group" ? `群 ${msg.groupId}` : `QQ ${msg.userId}`;
-        // 群友模式：独立于主白名单的群聊互动逻辑
-        if (msg.type === "group") {
-          // 异步处理（friendmode 配置读取）
-          readFriendConfig().then((fm) => {
-            if (!fm.enabled) {
-              // 群友模式关闭：群消息按原访问控制处理（白名单内才注入）
-              const ac = isAllowed("qq", String(msg.userId));
-              if (!ac.allowed) {
-                appendLog({ ts: new Date().toISOString(), kind: "qq_denied", from: msg.userId, text: msg.text }).catch(() => {});
-                return;
-              }
-              injectToAgent(agents, qqConfig.targetSession, `QQ 消息（来自 ${label}）：${msg.text}`, "qq_in", msg.userId, { readOnly: ac.readOnly }).catch(() => {});
-              return;
-            }
-            // 群友模式开启：黑名单过滤
-            if (isBlacklisted(fm, msg.groupId, msg.userId)) {
-              appendLog({ ts: new Date().toISOString(), kind: "friend_blacklisted", group: msg.groupId, from: msg.userId, text: msg.text }).catch(() => {});
-              return;
-            }
-            // 触发条件：@ 机器人 / 回复引用 / 提到称呼 / 私聊（群消息里用 @ 和回复）
-            const mentioned = msg.atMe || msg.isReply || (fm.nickname && msg.text.includes(fm.nickname));
-            // 记录独立群友记忆
-            appendFriendMemory({ userId: msg.userId, groupId: msg.groupId, text: msg.text }).catch(() => {});
-            if (!mentioned) {
-              // 没被 @ 也没提到 → 不回复（像真实网友，不主动插话）
-              appendLog({ ts: new Date().toISOString(), kind: "friend_pass", group: msg.groupId, from: msg.userId, text: msg.text }).catch(() => {});
-              return;
-            }
-            // 命中触发：注入会话，带群友提示词
-            buildFriendPrompt(fm).then((prompt) => {
-              injectToAgent(agents, qqConfig.targetSession,
-                `【群友模式·群 ${msg.groupId}】来自 ${msg.userId}：${msg.text}\n\n（回复请通过 notify(channel: "qq", groupId: "${msg.groupId}") 发回这个群。）\n\n${prompt}`,
-                "friend_in", msg.userId, { readOnly: fm.readOnly }).catch(() => {});
-            }).catch(() => {
-              injectToAgent(agents, qqConfig.targetSession, `【群友模式·群 ${msg.groupId}】来自 ${msg.userId}：${msg.text}\n\n（回复请通过 notify(channel: "qq", groupId: "${msg.groupId}") 发回这个群。）`, "friend_in", msg.userId).catch(() => {});
-            });
-          }).catch(() => {});
-          return;
-        }
-        // 私聊：按主访问控制处理
-        const ac = isAllowed("qq", String(msg.userId));
-        if (!ac.allowed) {
-          appendLog({ ts: new Date().toISOString(), kind: "qq_denied", from: msg.userId, text: msg.text }).catch(() => {});
-          return;
-        }
-        injectToAgent(agents, qqConfig.targetSession, `QQ 消息（来自 ${label}）：${msg.text}\n\n（本条指令来自 QQ 渠道——任务完成后请通过 notify(channel: "qq") 把结果发回该 QQ，让用户知道。）`, "qq_in", msg.userId, { readOnly: ac.readOnly }).catch(() => {});
+        state.qq.lastEventAt = new Date().toISOString();
+        state.qq.connections += 1;
+        handleQQMessage(msg).catch(() => {});
+      }, {
+        log: (...args) => appendLog({ kind: "qq", detail: args.map(String).join(" ") }).catch(() => {}),
+        onState: (status, error) => {
+          state.qq.status = status;
+          state.qq.lastError = error;
+        },
       });
-      ctx.effect(() => stopQQ);
+      state.qq.status = "up";
+      ctx.effect(() => stopQQ, "dsh-whale-notify qq receiver");
     } catch (error) {
-      console.error("[dsh-whale-notify] QQ 接收端启动失败:", error instanceof Error ? error.message : String(error));
+      state.qq.status = "failed";
+      state.qq.lastError = error instanceof Error ? error.message : String(error);
+      console.error("[dsh-whale-notify] QQ 接收端启动失败:", state.qq.lastError);
     }
   }
 
-  // 定时汇报：到点通过 notify 推送到配置的渠道（飞书/QQ/邮件等）。
-  // 需 enableReports: true 才会启用（默认关闭，避免别人复制配置后被动开启）。
-  // reports: [{ name, channel, schedule: "daily:HH:MM" | "every:<min>", text }]
+  /** Route one incoming QQ message: friend mode for groups, ACL for everything else. */
+  async function handleQQMessage(msg) {
+    const label = msg.type === "group" ? `群 ${msg.groupId}` : `QQ ${msg.userId}`;
+
+    if (msg.type === "group") {
+      const friend = await readFriendConfig().catch(() => ({ enabled: false }));
+      if (!friend.enabled) {
+        const verdict = await checkAccess("qq", String(msg.userId), "qq_in", msg.text);
+        if (!verdict.allowed) return;
+        const hint = replyHint
+          ? `\n\n（本条指令来自 QQ 群 ${msg.groupId}。完成后请用 notify(channel: "qq", groupId: "${msg.groupId}") 把结果发回该群，纯文本。）`
+          : "";
+        await injectToAgent(clampInbound(`QQ 消息（来自 ${label}）：${msg.text}${hint}`), {
+          targetSession: qqConfig.targetSession, kind: "qq_in", from: msg.userId,
+          readOnly: verdict.readOnly, meta: { groupId: msg.groupId },
+        });
+        return;
+      }
+
+      if (isBlacklisted(friend, msg.groupId, msg.userId)) {
+        await appendLog({ kind: "friend_blacklisted", group: msg.groupId, from: msg.userId });
+        return;
+      }
+
+      const nickname = String(friend.nickname ?? "");
+      const mentioned = msg.atMe || msg.isReply || (nickname !== "" && msg.text.includes(nickname));
+
+      // 记忆要记「所有群消息」，而不只是被 @ 的那几条 —— 没记忆就没法接话。
+      await appendFriendMemory({
+        userId: msg.userId, groupId: msg.groupId, text: msg.text,
+        name: msg.senderName, at: msg.atMe === true,
+      }).catch(() => {});
+
+      if (!mentioned) {
+        await appendLog({ kind: "friend_pass", group: msg.groupId, from: msg.userId });
+        return;
+      }
+
+      const prompt = await buildFriendPrompt(friend, { groupId: msg.groupId }).catch(() => "");
+      const header = `【群友模式·群 ${msg.groupId}】来自 ${msg.userId}${msg.senderName ? `（${msg.senderName}）` : ""}：${msg.text}`;
+      const hint = `（回复请通过 notify(channel: "qq", groupId: "${msg.groupId}") 发回这个群，1-2 句纯文本。）`;
+      await injectToAgent(clampInbound(`${header}\n\n${hint}${prompt ? `\n\n${prompt}` : ""}`), {
+        targetSession: qqConfig.targetSession, kind: "friend_in", from: msg.userId,
+        readOnly: friend.readOnly === true, meta: { groupId: msg.groupId },
+      });
+      return;
+    }
+
+    // 私聊
+    const verdict = await checkAccess("qq", String(msg.userId), "qq_in", msg.text);
+    if (!verdict.allowed) return;
+    const hint = replyHint
+      ? `\n\n（本条指令来自 QQ 私聊。完成后请用 notify(channel: "qq", to: "${msg.userId}") 把结果发回，纯文本。）`
+      : "";
+    await injectToAgent(clampInbound(`QQ 消息（来自 ${label}）：${msg.text}${hint}`), {
+      targetSession: qqConfig.targetSession, kind: "qq_in", from: msg.userId,
+      readOnly: verdict.readOnly, meta: { qq: msg.userId },
+    });
+  }
+
+  // ────────────────────────── 定时汇报 ──────────────────────────
   const reports = Array.isArray(resolved.reports) ? resolved.reports : [];
   const reportsEnabled = resolved.enableReports === true;
-  if (reportsEnabled && reports.length > 0 && typeof ctx.interval === "function") {
-    const fire = (report) => {
-      // 用 notify 的发送链路（复用 trySend 逻辑，无需 agent）
-      trySend(report.channel, resolved, `【定时汇报】${report.name}`, report.text, env)
-        .then((result) => {
-          appendLog({ ts: new Date().toISOString(), kind: "report", name: report.name, result }).catch(() => {});
-        })
-        .catch((error) => console.error("[dsh-whale-notify] 定时汇报失败:", error instanceof Error ? error.message : String(error)));
-    };
-    const isDue = (report) => {
-      const now = new Date();
-      const spec = String(report.schedule ?? "");
-      if (/^daily:(\d{2}):(\d{2})$/.test(spec)) {
-        const [, hh, mm] = /^daily:(\d{2}):(\d{2})$/.exec(spec);
-        return now.getHours() === Number(hh) && now.getMinutes() === Number(mm);
-      }
-      if (/^every:(\d+)$/.test(spec)) {
-        const minutes = Number(/^every:(\d+)$/.exec(spec)[1]);
-        return now.getMinutes() % minutes === 0 && now.getSeconds() < 30;
-      }
-      return false;
-    };
-    // 每 30 秒检查一次到点汇报（timer 已注入）
+  const scheduler = createReportScheduler(reports, async (report) => {
+    const result = await trySend(report.channel, resolved, `【定时汇报】${report.name}`, report.text, process.env);
+    await appendLog({ kind: "report", name: report.name, channel: report.channel, ok: result.ok, detail: result.detail });
+    if (!result.ok) throw new Error(result.detail);
+  }, { log: (record) => appendLog(record).catch(() => {}) });
+
+  if (reportsEnabled && reports.length > 0) {
+    // 20 秒一跳 + 分钟级去重：既不会漏掉某一分钟，也不会在一分钟内重复发。
     ctx.interval(() => {
-      for (const report of reports) {
-        if (isDue(report)) fire(report);
-      }
-    }, 30000);
+      scheduler.tick().catch((error) => {
+        console.error("[dsh-whale-notify] 定时汇报异常:", error instanceof Error ? error.message : String(error));
+      });
+    }, 20_000);
+  } else if (reports.length > 0) {
+    appendLog({ kind: "report_disabled", count: reports.length }).catch(() => {});
   }
+
+  // ────────────────────────── 工具：whale_check ──────────────────────────
   ctx.tools.register(defineTool({
     name: "whale_check",
     description:
-      "鲸鱼通知自检：报告各渠道配置状态、飞书长连接是否在收消息、当前有哪些存活会话可被注入、" +
-      "以及最近的收信/注入日志。当用户说「飞书发消息没反应」「通知发不出去」「插件是不是没生效」时用它定位。",
+      "鲸鱼通知自检：报告渠道配置（含 $ENV: 变量是否解析成功）、访问控制生效名单、飞书长连接与 QQ 接收端状态、"
+      + "可注入的会话、定时汇报计划与最近触发、待回复的邮件决策，以及日志尾部。"
+      + "当用户说「飞书/QQ 发消息没反应」「通知发不出去」「插件是不是没生效」时先跑它。",
     parameters: {},
     output: {
       schema: {
@@ -968,64 +776,125 @@ function apply(ctx, config) {
       },
       render: (_args, value) => [{ type: "text", text: value.report }],
     },
+    isConcurrencySafe: () => true,
     async execute() {
       const lines = [];
-      const yn = (v) => (v ? "已配置" : "未配置");
-      // 时间戳 + 构建标记：报告可能与日志不同步（旧实例/旧快照），
-      // 标注生成时刻与是否含 v4 source 修复，一眼判读。
-      lines.push(`## 自检时间 ${new Date().toISOString()}（进程 pid ${process.pid}）`);
+      const mark = (ok) => (ok ? "✅" : "❌");
+      lines.push(`## 自检 ${new Date().toLocaleString("zh-CN", { hour12: false })}（pid ${process.pid}）`);
       lines.push(`## 构建标记 ${BUILD_TAG}`);
       lines.push("");
+
+      // 渠道
       lines.push("## 渠道");
       lines.push(`- 默认渠道: ${resolved.defaultChannel || "(未设，发往全部已配置渠道)"}`);
-      const fbOk = feishuBotConfig && !isConfigError(feishuBotConfig);
-      lines.push(`- 飞书开放平台(feishu_bot): ${yn(fbOk)}` + (fbOk
-        ? ` — receiveId=${feishuBotConfig.receiveId || "(空)"} / targetSession=${feishuBotConfig.targetSession || "(自动选最近会话)"}`
-        : ""));
-      lines.push(`- 飞书群 webhook: ${yn(resolveChannel(resolved, "feishu", env))}`);
-      lines.push(`- 微信 Server酱: ${yn(resolveChannel(resolved, "serverchan", env))}`);
-      lines.push(`- 企业微信: ${yn(resolveChannel(resolved, "wecom", env))}`);
-      lines.push(`- 钉钉: ${yn(resolveChannel(resolved, "dingtalk", env))}`);
-      lines.push(`- 邮件 SMTP: ${yn(resolveChannel(resolved, "smtp", env))} / IMAP: ${yn(imapConfig)}`);
-      lines.push(`- QQ/OneBot: ${yn(qqConfig && !isConfigError(qqConfig))}`);
+      for (const channel of CHANNELS) {
+        const entry = resolveChannel(resolved, channel, env);
+        const label = CHANNEL_LABELS[channel] ?? channel;
+        if (entry === undefined) {
+          lines.push(`- ${mark(false)} ${label}（${channel}）: 未配置`);
+        } else if (isConfigError(entry)) {
+          lines.push(`- ${mark(false)} ${label}（${channel}）: ${entry.error}`);
+        } else {
+          let extra = "";
+          if (channel === "feishu_bot") extra = ` — receiveId=${entry.receiveId} / 类型=${entry.receiveIdType} / targetSession=${entry.targetSession || "(自动)"}`;
+          if (channel === "smtp") extra = ` — ${entry.user} → ${entry.to.join(", ")}`;
+          if (channel === "qq") extra = ` — 私聊=${entry.qq || "(无)"} 群=${entry.groupId || "(无)"} ws=${entry.wsHost}:${entry.wsPort}`;
+          lines.push(`- ${mark(true)} ${label}（${channel}）: 已配置${extra}`);
+        }
+      }
+
+      // 环境变量
+      const envRefs = describeEnvRefs(resolved, env);
       lines.push("");
-      lines.push("## 飞书长连接（实时收信）");
-      lines.push(`- 状态: ${feishuLink.state}${feishuLink.since ? `（自 ${feishuLink.since}）` : ""}`);
-      if (feishuLink.error) lines.push(`- 错误: ${feishuLink.error}`);
-      lines.push(`- 长连接事件数: ${feishuLink.events}`);
-      // 条件化提示：轮询已移除，长连接是唯一收信通道，所以这条提示现在是排障重点。
-      if (feishuLink.state === "up" && feishuLink.events === 0) {
-        lines.push("- 长连接已建立但尚未收到任何事件（待机中属正常）");
-        lines.push("  ⚠️ 若「刚刚确实在飞书发过消息」却仍为 0：去飞书开发者后台 → 事件与回调 →");
-        lines.push("     订阅方式改成「使用长连接接收事件」，并确认已订阅 im.message.receive_v1、已发布版本");
-      } else if (feishuLink.state === "failed") {
-        lines.push("- ⚠️ 长连接未建立：收信不可用（发信不受影响）；看上面的错误信息");
+      lines.push("## $ENV: 变量");
+      if (envRefs.length === 0) {
+        lines.push("- 配置里没有 `$ENV:` 引用");
+      } else {
+        for (const row of envRefs) {
+          const where = row.from === "env" ? "进程环境" : row.from === "registry" ? "用户环境变量(注册表)" : "未设置";
+          lines.push(`- ${mark(row.ok)} ${row.name}（${row.path}）: ${where}`);
+        }
       }
-      if (feishuPoll.lastAt) {
-        lines.push(`- 最后收到的消息: ${feishuPoll.lastAt}（id ${feishuPoll.lastId ?? "-"}）`);
+
+      // 访问控制
+      lines.push("");
+      lines.push("## 访问控制");
+      lines.push(`- 模式: ${acl.mode}${acl.mode === "whitelist" ? "（仅名单内可指挥）" : "（所有人可指挥）"}`);
+      if (acl.mode === "whitelist") {
+        lines.push(`- 飞书白名单: ${acl.allowed.feishu.join(", ") || "(空)"}`);
+        lines.push(`- QQ 白名单: ${acl.allowed.qq.join(", ") || "(空)"}`);
+        if (acl.emptyWhitelist()) {
+          lines.push("  ⚠️ 白名单解析后为空 —— 谁发的消息都会被丢弃。检查 allowedUsers 里的 `$ENV:` 变量是否真的存在。");
+        }
+        const readOnlyCount = acl.readOnly.feishu.length + acl.readOnly.qq.length;
+        if (readOnlyCount > 0) lines.push(`- 只读名单: ${readOnlyCount} 个`);
       }
-      lines.push(`- 已去重记录: ${seenFeishuMessages.size} 条（logs/feishu-seen.json，用于长连接重连重投去重）`);
+
+      // 飞书长连接
+      lines.push("");
+      lines.push("## 飞书长连接（收信）");
+      lines.push(`- 状态: ${state.feishu.status}${state.feishu.since ? `（自 ${new Date(state.feishu.since).toLocaleString("zh-CN", { hour12: false })}）` : ""}`);
+      if (state.feishu.lastError) lines.push(`- 最近错误: ${state.feishu.lastError}`);
+      lines.push(`- 已收到事件: ${state.feishu.events}${state.feishu.lastEventAt ? `（最后一条 ${new Date(state.feishu.lastEventAt).toLocaleString("zh-CN", { hour12: false })}）` : ""}`);
+      if (state.feishu.restarts > 0) lines.push(`- 重连次数: ${state.feishu.restarts}`);
+      if (state.feishu.status === "up" && state.feishu.events === 0) {
+        lines.push("  ⚠️ 连接正常但还没收到任何事件。若刚在飞书发过消息仍为 0：");
+        lines.push("     开发者后台 → 事件与回调 → 订阅方式必须是「使用长连接接收事件」，");
+        lines.push("     并确认已订阅 im.message.receive_v1、权限含 im:message、且版本已发布。");
+      }
+      if (state.feishu.status === "failed") {
+        lines.push("  ⚠️ 长连接未建立：收信不可用（发信不受影响）。看上面的错误。");
+      }
+      lines.push(`- 已去重消息: ${seen.map.size} 条（logs/feishu-seen.json）`);
+
+      // QQ
+      lines.push("");
+      lines.push("## QQ 接收端");
+      lines.push(`- 状态: ${state.qq.status}${state.qq.lastError ? `（${state.qq.lastError}）` : ""}`);
+      lines.push(`- 端口: ${qqConfig?.wsPort ?? "(未配置)"}${state.qq.connections > 0 ? ` / 收到连接 ${state.qq.connections} 次` : ""}`);
+      if (state.qq.lastEventAt) lines.push(`- 最后一条消息: ${new Date(state.qq.lastEventAt).toLocaleString("zh-CN", { hour12: false })}`);
+      if (qqConfig && state.qq.connections === 0) {
+        lines.push("  ℹ️ 还没有 NapCat 连上来 —— 在 NapCat 里把反向 WS 指向本端口。");
+      }
+
+      // 会话
       lines.push("");
       lines.push("## 可注入的会话");
-      const agents = ctx.get("agents");
-      if (!agents || typeof agents.list !== "function") {
-        lines.push("- agents 服务不可用：外部渠道消息无法注入");
-      } else {
-        const list = agents.list();
-        lines.push(`- 存活 agent 数: ${list.length}`);
-        for (const a of list) {
-          const id = a?.id ?? a?.session?.header?.id ?? "(无 id)";
-          const t = agentLastActive(a);
-          lines.push(`  - ${id}  最后活跃=${t ? new Date(t).toISOString() : "未知"}`);
-        }
-        if (list.length === 0) lines.push("  （没有任何会话存活 → 外部消息会注入失败；请在客户端里打开一个会话）");
+      const live = liveAgents();
+      lines.push(`- 存活 agent: ${live.length}（其中子代理 ${live.filter((row) => isSubagent(row.agent)).length}）`);
+      for (const row of live.slice(0, 12)) {
+        const active = agentLastActive(row.agent);
+        const flag = isSubagent(row.agent) ? " [subagent]" : "";
+        const last = lastInjectedSession === row.id ? " ← 上次注入" : "";
+        lines.push(`  - ${row.id}${flag} 最后活跃=${active ? new Date(active).toLocaleString("zh-CN", { hour12: false }) : "未知"}${last}`);
       }
+      if (live.length === 0) lines.push("  ⚠️ 一个都没有 —— 外部消息必定注入失败，客户端里要开着一个会话。");
+      lines.push(`- 已注入 ${state.injected} 条 / 被拒绝 ${state.denied} 条`);
+
+      // 邮件决策
       lines.push("");
-      lines.push("## 最近日志（$DSH_HOME/logs/notify.log 尾部）");
+      lines.push("## 邮件");
+      lines.push(`- SMTP: ${usable(resolveChannel(resolved, "smtp", env)) ? "已配置" : "未配置"}`);
+      lines.push(`- IMAP: ${imapConfig ? `已配置（每 ${Math.round(pollIntervalMs / 1000)}s 轮询）` : imapProblem ?? "未配置"}`);
+      lines.push(`- 待回复决策: ${pendingIds().length} 个`);
+
+      // 定时汇报
+      lines.push("");
+      lines.push("## 定时汇报");
+      lines.push(`- 总开关: ${reportsEnabled ? "开" : "关（enableReports=false）"} / 计划 ${reports.length} 条`);
+      if (reports.length > 0) {
+        for (const row of scheduler.describe()) {
+          lines.push(`  - ${row.name} → ${row.channel} / ${row.schedule}${row.valid ? "" : " ⚠️ 格式无法识别"}${row.lastFired ? ` / 上次 ${row.lastFired}` : ""}`);
+        }
+      }
+      if (!reportsEnabled && reports.length > 0) lines.push("  ℹ️ 计划存在但总开关是关的；用 settings set enableReports true 打开。");
+
+      // 日志
+      lines.push("");
+      lines.push("## 最近日志");
       try {
-        const home = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? ".", ".dsh");
-        const raw = await readFile(join(home, "logs", "notify.log"), "utf8");
-        for (const line of raw.trim().split("\n").slice(-8)) lines.push(`  ${line.slice(0, 220)}`);
+        const raw = await readFile(join(dshHome(), "logs", "notify.log"), "utf8");
+        for (const line of raw.trim().split("\n").slice(-10)) lines.push(`  ${line.slice(0, 240)}`);
       } catch (error) {
         lines.push(`  （读取失败：${error instanceof Error ? error.message : String(error)}）`);
       }
@@ -1034,16 +903,15 @@ function apply(ctx, config) {
     presentCall: () => ({ card: "generic", title: "Whale check", kind: "other" }),
   }));
 
+  // ────────────────────────── 工具：notify ──────────────────────────
   ctx.tools.register(defineTool({
     name: "notify",
     description:
-      "向用户发送一条通知消息。渠道可选：feishu_bot（飞书开放平台，双向聊天，推荐）、" +
-      "serverchan（微信 Server酱）、feishu（飞书群 webhook）、wecom（企业微信）、" +
-      "dingtalk（钉钉）、smtp（邮件）。" +
-      "当耗时任务完成、失败，或需要用户离开聊天也能注意到时使用。" +
-      "传入标题和正文；可选指定 channel（渠道）或 'all'（全部渠道）。" +
-      "未配置的渠道会被跳过。",
-    parameters: PARAMETERS,
+      "给用户发一条通知。渠道：feishu_bot（飞书开放平台，推荐）、qq（QQ/NapCat）、smtp（邮箱）、serverchan（微信）、"
+      + "feishu（飞书群 webhook）、wecom（企业微信）、dingtalk（钉钉）。"
+      + "耗时任务完成、失败、或需要用户离开聊天也能看到时使用。"
+      + "从飞书/QQ 收到指令后，用 to/groupId 把结果发回原会话。未配置的渠道会被跳过。",
+    parameters: NOTIFY_PARAMETERS,
     output: {
       schema: {
         type: "object",
@@ -1066,66 +934,68 @@ function apply(ctx, config) {
       },
       render: (_args, value) => [{
         type: "text",
-        text: value.delivered.map((d) => `${d.channel}: ${d.ok ? "OK" : "FAILED — " + d.detail}`).join("\n"),
+        text: value.delivered.map((row) => `${row.channel}: ${row.ok ? "OK" : `FAILED — ${row.detail}`}`).join("\n"),
       }],
     },
     async execute(args, exec) {
       const title = formatTitle(args.title, args.level);
-      const channels = targetChannels(args.channel, resolved, process.env);
+      let channels;
+      try {
+        channels = targetChannels(args.channel, resolved, process.env);
+      } catch (error) {
+        throw new Error(error instanceof Error ? error.message : String(error));
+      }
       if (channels.length === 0) {
-        throw new Error("notify：尚未配置任何通知渠道 —— 请在 tool-notify 插件配置中添加 webhook 或 SMTP 信息");
+        if (args.channel && args.channel !== "all") {
+          const entry = resolveChannel(resolved, args.channel, process.env);
+          const why = isConfigError(entry) ? `：${entry.error}` : "：该渠道未配置";
+          throw new Error(`notify：渠道 ${args.channel} 不可用${why}`);
+        }
+        throw new Error("notify：没有任何可用的通知渠道 —— 检查插件配置（whale_check 能列出缺什么）");
       }
-      // awaitReply=true：让邮件通知可回复指挥（要求已配置 imap 收信）。
-      let reply = undefined;
+
+      // awaitReply=true：邮件通知带决策编号，回复即指令（需要 IMAP 收信）。
+      let reply;
       if (args.awaitReply === true) {
-        if (!imapConfig) {
-          throw new Error("notify(awaitReply:true)：需要先配置 imap（收信）才能接收你的邮件回复 —— 请在 tool-notify 插件配置中添加 imap 段");
-        }
+        if (!imapConfig) throw new Error(`notify(awaitReply:true)：需要先配置可用的 imap（收信）${imapProblem ? ` —— ${imapProblem}` : ""}`);
         const smtp = resolveChannel(resolved, "smtp", env);
-        if (!smtp || isConfigError(smtp)) {
-          throw new Error("notify(awaitReply:true)：需要先配置 smtp（发信）才能发送可回复的通知邮件");
-        }
-        reply = {
-          id: registerPending(exec.agent, title, smtp.to, undefined, "command"),
-        };
+        if (!usable(smtp)) throw new Error("notify(awaitReply:true)：需要先配置可用的 smtp（发信）");
+        reply = { id: registerPending(exec.agent, title, smtp.to, undefined, "command") };
       }
+
       const delivered = [];
       for (const channel of channels) {
-        delivered.push(await trySend(channel, resolved, title, args.message, process.env, reply, { groupId: args.groupId }));
-      }
-      const failed = delivered.filter((d) => !d.ok);
-      // 发送日志：追加 JSONL 到 $DSH_HOME/logs/notify.log（失败静默降级，不影响通知）。
-      try {
-        await appendLog({
-          ts: new Date().toISOString(),
-          title,
-          channels: delivered,
-          allOk: failed.length === 0,
-          ...reply ? { decisionId: reply.id } : {},
+        const result = await trySend(channel, resolved, title, args.message, process.env, reply, {
+          groupId: args.groupId,
+          to: args.to,
         });
-      } catch {
-        // 日志失败不影响发送结果。
+        // 输出 schema 只声明 channel/ok/detail；trySend 里的 parts 等内部字段不能透传，
+        // 否则内核会以 `additionalProperties: false` 拒收整个工具结果。
+        delivered.push({ channel: result.channel, ok: result.ok, detail: result.detail });
       }
-      if (failed.length === delivered.length) {
-        throw new Error(`notify：所有渠道都发送失败 —— ${failed.map((d) => `${d.channel}（${d.detail}）`).join("；")}`);
+
+      await appendLog({
+        kind: "notify",
+        title,
+        channels: delivered,
+        allOk: delivered.every((row) => row.ok),
+        ...(reply ? { decisionId: reply.id } : {}),
+      });
+
+      if (!delivered.some((row) => row.ok)) {
+        throw new Error(`notify：所有渠道都发送失败 —— ${delivered.map((row) => `${row.channel}（${row.detail}）`).join("；")}`);
       }
       return { delivered };
     },
-    presentCall: (args) => ({
-      card: "generic",
-      title: "Notify user",
-      kind: "other",
-      rawInput: args.title,
-    }),
+    presentCall: (args) => ({ card: "generic", title: "Notify user", kind: "other", rawInput: args.title }),
   }));
 
-  // ── ask_user_email：发邮件询问用户，并轮询回复后唤醒 agent ──
+  // ────────────────────────── 工具：ask_user_email ──────────────────────────
   ctx.tools.register(defineTool({
     name: "ask_user_email",
     description:
-      "通过电子邮件向用户提问并等待回复。适合需要用户决策/审批、但用户不在电脑前时使用：" +
-      "邮件发出后本工具立即返回，插件会后台轮询收件箱；用户回复邮件后，回复内容会作为一条" +
-      "用户消息注入回当前会话，agent 据此继续。要求配置了 smtp（发）和 imap（收）。",
+      "通过邮件向用户提问并等待回复。适合需要用户决策/审批、但用户不在电脑前时：邮件发出后本工具立即返回，"
+      + "插件在后台轮询收件箱；用户回复后，回复内容作为一条用户消息注入本会话，agent 据此继续。需配置 smtp + imap。",
     parameters: ASK_PARAMETERS,
     output: {
       schema: {
@@ -1139,37 +1009,26 @@ function apply(ctx, config) {
       },
       render: (_args, value) => [{
         type: "text",
-        text: `已通过邮件询问用户（${value.sentTo}）。决策编号 ${value.decisionId}。${value.note}`,
+        text: `已通过邮件询问用户（${value.sentTo}），决策编号 ${value.decisionId}。${value.note}`,
       }],
     },
     async execute(args, exec) {
       const smtp = resolveChannel(resolved, "smtp", env);
-      if (!smtp || isConfigError(smtp)) {
-        throw new Error("ask_user_email：需要先配置 smtp（发信）才能发送询问邮件");
-      }
-      if (!imapConfig) {
-        throw new Error("ask_user_email：需要先配置 imap（收信）才能接收用户的邮件回复 —— 请在 tool-notify 插件配置中添加 imap 段");
-      }
+      if (!usable(smtp)) throw new Error(`ask_user_email：smtp（发信）不可用${isConfigError(smtp) ? ` —— ${smtp.error}` : "（未配置）"}`);
+      if (!imapConfig) throw new Error(`ask_user_email：imap（收信）不可用${imapProblem ? ` —— ${imapProblem}` : "（未配置）"}`);
+
       const recipients = smtp.to.length > 0 ? smtp.to : ["no-reply@localhost"];
       const id = registerPending(exec.agent, args.question, recipients);
 
       const optionsText = Array.isArray(args.options) && args.options.length > 0
-        ? `\n\n可选项：${args.options.map((o) => `「${o}」`).join("、")}（直接回复其中一个即可）`
+        ? `\n\n可选项：${args.options.map((option) => `「${option}」`).join("、")}（直接回复其中一个即可）`
         : "";
       const contextText = args.context ? `\n\n背景：${args.context}` : "";
-      const body =
-        `你好，agent 需要你做一个决定：\n\n${args.question}${optionsText}${contextText}\n\n` +
-        `请直接回复这封邮件告知你的选择（例如：继续 / 取消 / 具体指示）。回复会自动回到会话中。`;
+      const body = `你好，agent 需要你做一个决定：\n\n${args.question}${optionsText}${contextText}\n\n`
+        + "请直接回复这封邮件告知你的选择（例如：继续 / 取消 / 具体指示）。回复会自动回到会话中。";
 
-      const title = `${decisionTag(id)} 需要你的决定：${args.question.slice(0, 40)}`;
-      await sendEmail(smtp, title, body);
-      await appendLog({
-        ts: new Date().toISOString(),
-        kind: "ask_user_email",
-        decisionId: id,
-        question: args.question,
-        sentTo: recipients,
-      }).catch(() => {});
+      await sendEmail(smtp, `${decisionTag(id)} 需要你的决定：${args.question.slice(0, 40)}`, body);
+      await appendLog({ kind: "ask_user_email", decisionId: id, question: args.question, sentTo: recipients });
 
       return {
         decisionId: id,
@@ -1177,33 +1036,27 @@ function apply(ctx, config) {
         note: "用户回复后会自动回到本会话，请等待（不要重复询问）。",
       };
     },
-    presentCall: (args) => ({
-      card: "generic",
-      title: "Ask user by email",
-      kind: "other",
-      rawInput: args.question,
-    }),
+    presentCall: (args) => ({ card: "generic", title: "Ask user by email", kind: "other", rawInput: args.question }),
   }));
 
-  // ── recall_memory：从历史会话恢复记忆 ──
-  // 用 host 的 sessionQuery（listSessions + readSurface）自己实现搜索与注入，
-  // 不依赖额外服务或 realm（sessionQuery 是 host 层服务，可选获取）。
+  // ────────────────────────── 工具：recall_memory ──────────────────────────
   const sessionQuery = ctx.get("sessionQuery");
   if (sessionQuery && typeof sessionQuery.listSessions === "function") {
     ctx.tools.register(defineTool({
       name: "recall_memory",
       description:
-        "从历史会话中恢复记忆。新会话需要延续之前的工作（如项目进展、用户偏好、上次结论）时，" +
-        "先用关键词搜索候选会话，再选择要引用的会话，把其关键内容注入当前会话。",
+        "从记忆库或历史会话恢复上下文。先搜统一记忆库文档（快且准），没有命中再按关键词找历史会话并注入其要点。"
+        + "新会话需要延续之前的工作（项目进展、用户偏好、上次结论）时使用。",
       parameters: {
         query: {
           type: "string",
           required: true,
-          description: "搜索关键词：会话标题、工作目录或会话 ID 的一部分，例如「股市复盘」「README」。",
+          description: "关键词：标题、工作目录或会话 ID 的一部分，多个词用空格分隔（全部命中）。",
         },
-        sessionId: {
-          type: "string",
-          description: "可选：直接指定要恢复的会话 ID（跳过搜索确认步骤，当你知道确切 ID 时用）。",
+        sessionId: { type: "string", description: "可选：直接指定会话 ID，跳过搜索确认。" },
+        includeTranscript: {
+          type: "boolean",
+          description: "为 true 时把历史会话最近 30 条对话原文也注入（默认只注入记忆文档）。",
         },
       },
       output: {
@@ -1219,412 +1072,347 @@ function apply(ctx, config) {
       },
       async execute(args, exec) {
         if (!exec.agent) throw new Error("recall_memory 需要 agent 会话上下文");
-        // ① 先搜统一记忆库（总结文档，快且准）
+
         const docs = await searchMemoryDocs(args.query, 5);
-        if (docs.length > 0) {
+        if (docs.length > 0 && !args.sessionId) {
           const doc = docs[0];
           const content = await readMemoryDoc(doc.path);
-          if (exec.agent.followup) {
-            exec.agent.followup(buildUserMessage(
-              `## 从记忆库恢复的记忆（${doc.title}）\n\n${content}\n\n（此记忆来自统一记忆库 ${doc.category}，作为背景参考。）`,
-              name,
-            ));
-            return { injected: true, detail: `已从记忆库恢复「${doc.title}」（${doc.category}）。` };
-          }
-        }
-        const currentId = exec.agent.id;
-        let chosenSession;
-        if (args.sessionId) {
-          chosenSession = { sessionId: args.sessionId, label: args.sessionId };
-        } else {
-          const records = await sessionQuery.listSessions();
-          const needle = args.query.toLowerCase();
-          const matches = (records ?? [])
-            .filter((r) => r?.header?.id !== currentId)
-            .filter((r) => {
-              const id = r.header?.id ?? "";
-              const cwd = r.header?.cwd ?? "";
-              const title = r.header?.title ?? "";
-              return id.toLowerCase().includes(needle) || cwd.toLowerCase().includes(needle) || title.toLowerCase().includes(needle);
-            })
-            .slice(0, 5);
-          if (matches.length === 0) {
-            return { injected: false, detail: `未找到匹配「${args.query}」的历史会话。` };
-          }
-          chosenSession = { sessionId: matches[0].header.id, label: matches[0].header.id };
+          exec.agent.followup(buildUserMessage(
+            `## 从记忆库恢复的记忆（${doc.title}）\n\n${content}\n\n（来自统一记忆库 ${doc.category}，作为背景参考。）`,
+          ));
+          const others = docs.slice(1).map((row) => `「${row.title}」`).join("、");
           return {
-            injected: false,
-            detail: `找到 ${matches.length} 个候选会话：${matches.map((m) => `「${m.header?.id}」(${m.header?.cwd ?? ""})`).join("、")}。` +
-              ` 若要恢复「${chosenSession.sessionId}」，请调用 recall_memory 并传 sessionId="${chosenSession.sessionId}"。`,
+            injected: true,
+            detail: `已从记忆库恢复「${doc.title}」（${doc.category}）。${others ? `另有相关文档：${others}。` : ""}`,
           };
         }
-        // 读取目标会话的对话表面（用户/助手消息）
-        const surface = await sessionQuery.readSurface(chosenSession.sessionId);
-        if (!surface?.events || surface.events.length === 0) {
-          return { injected: false, detail: `会话「${chosenSession.label}」没有可读取的对话内容。` };
+
+        const currentId = exec.agent.id;
+        let sessionId = args.sessionId;
+        if (!sessionId) {
+          const records = await sessionQuery.listSessions();
+          const terms = String(args.query).toLowerCase().split(/\s+/).filter(Boolean);
+          const matches = (records ?? [])
+            .filter((record) => record?.header?.id !== currentId && record?.header?.origin !== "subagent")
+            .map((record) => {
+              const haystack = `${record.header?.id ?? ""} ${record.header?.cwd ?? ""} ${record.header?.title ?? ""}`.toLowerCase();
+              const hits = terms.filter((term) => haystack.includes(term)).length;
+              return { record, hits };
+            })
+            .filter((row) => row.hits === terms.length && row.hits > 0)
+            .slice(0, 5);
+          if (matches.length === 0) {
+            return { injected: false, detail: `记忆库和历史会话里都没有匹配「${args.query}」的内容。` };
+          }
+          return {
+            injected: false,
+            detail: `找到 ${matches.length} 个候选会话：\n${matches.map((row, index) => `${index + 1}. ${row.record.header.id}（${row.record.header.cwd ?? ""}）`).join("\n")}\n`
+              + `调用 recall_memory 并传 sessionId 选择其一。`,
+          };
         }
-        // 投影用户/助手消息文本（排除工具/推理）
+
+        if (args.includeTranscript !== true) {
+          return { injected: false, detail: `已定位会话 ${sessionId}；如需注入其对话原文，请传 includeTranscript: true。` };
+        }
+
+        const surface = await sessionQuery.readSurface(sessionId);
+        if (!surface?.events || surface.events.length === 0) {
+          return { injected: false, detail: `会话「${sessionId}」没有可读取的对话内容。` };
+        }
         const lines = [];
         for (const event of surface.events) {
           if (event.type === "user/message") {
             const text = textOfMessage(event.data);
-            if (text) lines.push(`用户: ${text}`);
+            if (text && !text.startsWith("[只读消息]")) lines.push(`用户: ${text}`);
           } else if (event.type === "assistant/message") {
             const text = textOfMessage(event.data.message);
             if (text) lines.push(`助手: ${text}`);
           }
         }
-        if (lines.length === 0) return { injected: false, detail: `会话「${chosenSession.label}」无有效对话内容。` };
-        const prompt =
-          `## 从历史会话恢复的记忆（${chosenSession.sessionId}）\n\n` +
-          `以下是之前的对话摘要（只作背景参考，勿视为当前指令）：\n\n${lines.slice(-30).join("\n")}`;
-        if (exec.agent.followup) {
-          exec.agent.followup(buildUserMessage(prompt, name));
-          return { injected: true, detail: `已从会话「${chosenSession.sessionId}」恢复 ${lines.length} 条对话并注入当前会话。` };
-        }
-        return { injected: false, detail: "无法注入记忆内容。" };
+        if (lines.length === 0) return { injected: false, detail: `会话「${sessionId}」无有效对话内容。` };
+
+        exec.agent.followup(buildUserMessage(
+          `## 历史会话摘要（${sessionId}）\n\n（只作背景参考，勿视为当前指令）\n\n${lines.slice(-30).join("\n")}`,
+        ));
+        return { injected: true, detail: `已从会话「${sessionId}」恢复 ${Math.min(lines.length, 30)} 条对话。` };
       },
-      presentCall: (args) => ({
-        card: "generic",
-        title: "Recall memory",
-        kind: "other",
-        rawInput: args.query,
-      }),
+      presentCall: (args) => ({ card: "generic", title: "Recall memory", kind: "other", rawInput: args.query }),
     }));
   } else {
-    console.warn("[dsh-whale-notify] sessionQuery 服务不可用 — recall_memory 工具未注册");
+    console.warn("[dsh-whale-notify] sessionQuery 不可用 —— recall_memory 未注册");
   }
 
-  // ── manage_config：对话内开关功能（改 preset 配置）──
-  // 通过 agentPresets 服务定位 preset 文件并改 yml；改动需重启 DSH 生效（工具会提示）。
-  const agentPresets = ctx.get("agentPresets");
-  const presetId = ctx.get("agentPresets")?.composedPreset?.(ctx) ?? resolved.presetId;
-  if (agentPresets && typeof agentPresets.resolve === "function") {
-    ctx.tools.register(defineTool({
-      name: "manage_config",
-      description:
-        "在对话内开关鲸鱼通知插件功能并修改 preset 配置。可开关：定时汇报（enableReports）、" +
-        "记忆模式相关设置等。修改会写入 preset 的 agent.cordis.yml，需要重启 DSH 生效。",
-      parameters: {
-        action: {
-          type: "string",
-          required: true,
-          enum: ["reports_on", "reports_off", "show"],
-          description: "reports_on=开启定时汇报；reports_off=关闭定时汇报；show=显示当前配置。",
-        },
-      },
-      output: {
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            ok: { type: "boolean", required: true },
-            detail: { type: "string", required: true },
-          },
-        },
-        render: (_args, value) => [{ type: "text", text: value.detail }],
-      },
-      async execute(args) {
-        const presetIdToUse = presetId;
-        if (!presetIdToUse) {
-          return {
-            ok: false,
-            detail:
-              "无法确定当前 preset。DSH 0.2.x 已不再使用 $DSH_HOME/.agent-presets 目录：" +
-              "preset 现在是 profile 组合里的 `@deepseek-ai/dsh-agent-preset` 行，" +
-              "渠道配置则属于插件包自己的 cordis.patch.yml。" +
-              "请直接改 dsh-whale-notify 的 cordis.patch.yml，或用 whale_check 先看现状。",
-          };
-        }
-        try {
-          const presetPath = await agentPresets.resolve(presetIdToUse);
-          if (!presetPath) return { ok: false, detail: `找不到 preset「${presetIdToUse}」的组合文件。` };
-          const { readFile, writeFile } = await import("node:fs/promises");
-          let content = await readFile(presetPath, "utf8");
-          if (args.action === "reports_on") {
-            content = content.replace(/enableReports:\s*(true|false)/, "enableReports: true");
-            if (!content.includes("enableReports:")) {
-              content = content.replace(/(reports:\s*\[)/, "enableReports: true\n    $1");
-            }
-            await writeFile(presetPath, content, "utf8");
-            return { ok: true, detail: "已开启定时汇报（enableReports: true）。重启 DSH 后生效。" };
-          }
-          if (args.action === "reports_off") {
-            content = content.replace(/enableReports:\s*(true|false)/, "enableReports: false");
-            await writeFile(presetPath, content, "utf8");
-            return { ok: true, detail: "已关闭定时汇报（enableReports: false）。重启 DSH 后生效。" };
-          }
-          if (args.action === "show") {
-            const match = content.match(/enableReports:\s*(true|false)/);
-            return { ok: true, detail: `当前 enableReports: ${match ? match[1] : "未设置(默认 false)"}。` };
-          }
-          return { ok: false, detail: `未知操作 ${args.action}。` };
-        } catch (error) {
-          return { ok: false, detail: `修改配置失败: ${error instanceof Error ? error.message : String(error)}` };
-        }
-      },
-      presentCall: (args) => ({
-        card: "generic",
-        title: "Manage config",
-        kind: "other",
-        rawInput: args.action,
-      }),
-    }));
-  }
-
-  // ── settings：对话内查看/修改配置（统一总控）──
-  // agent 在对话中提到「配置/功能/设置」时用本工具：get 列出模块清单与选项，
-  // set 按路径改 preset 配置（支持数组追加）。改动需重启 DSH 生效。
-  const resolvePresetPath = async () => {
-    const pid = presetId;
-    if (!pid || !agentPresets?.resolve) return undefined;
-    try {
-      return await agentPresets.resolve(pid);
-    } catch {
-      return undefined;
-    }
+  // ────────────────────────── 工具：settings ──────────────────────────
+  // 配置真实来源 = profile 里 `tool-notify` 这一行（由本 bundle 的 cordis.patch.yml 插入，
+  // profile 的 cordis.patch.yml 可覆盖）。用 `configEditor` 写入：它会校验 schema 并
+  // **立即热重载**，不用重启客户端 —— 旧实现改的是已废弃的 preset 目录，永远不生效。
+  const configEditor = ctx.get("configEditor");
+  const findEntry = () => {
+    if (!configEditor) return undefined;
+    const entries = configEditor.entries();
+    return entries.find((entry) => entry.options.id === "tool-notify" && entry.options.name === "dsh-whale-notify")
+      ?? entries.find((entry) => entry.options.id === "tool-notify");
+  };
+  /** Current effective config (falls back to the applied snapshot). */
+  const currentConfig = () => {
+    const entry = findEntry();
+    return entry?.options?.config ?? resolved;
   };
 
-  // 功能模块清单：每个模块的说明 + 可配置项（供 get 展示，agent 据此引导）
-  const MODULES = [
-    { key: "notify", name: "📢 通知", desc: "任务完成/状态通知（飞书/QQ/邮件/微信/钉钉/企微）", options: [{ path: "defaultChannel", label: "默认渠道", type: "string" }] },
-    { key: "report", name: "📅 定时汇报", desc: "每日定点/定期推送（默认关闭）", options: [
-      { path: "enableReports", label: "开关", type: "bool", value: () => resolved.enableReports === true },
-    ] },
-    { key: "friend", name: "👥 群友模式", desc: "QQ 群里像网友互动（黑名单/称呼/触发）", options: [
-      { path: "friend.enabled", label: "开关", type: "bool", value: () => false },
-      { path: "friend.nickname", label: "称呼", type: "string" },
-      { path: "friend.blacklist.groups", label: "屏蔽群", type: "array" },
-      { path: "friend.blacklist.users", label: "屏蔽用户", type: "array" },
-    ] },
-    { key: "acl", name: "🔐 访问控制", desc: "谁可指挥（白名单/开放）", options: [
-      { path: "accessControl.mode", label: "模式", type: "enum", values: ["whitelist", "open"] },
-      { path: "accessControl.allowedUsers.qq", label: "白名单QQ", type: "array" },
-      { path: "accessControl.allowedUsers.feishu", label: "白名单飞书", type: "array" },
-    ] },
-    { key: "memory", name: "🧠 记忆模式", desc: "新会话恢复历史记忆", options: [] },
-    { key: "learn", name: "🎓 学习模式", desc: "技能知识库（learn_skill/recall_skill）", options: [] },
+  /** Modules shown by `settings get`. */
+  const moduleList = () => [
+    {
+      key: "notify", name: "📢 通知", desc: "任务通知渠道",
+      options: [
+        { path: "defaultChannel", label: "默认渠道", type: "enum", values: CHANNELS },
+      ],
+    },
+    {
+      key: "report", name: "📅 定时汇报", desc: "每日/定期推送（默认关闭）",
+      options: [{ path: "enableReports", label: "开关", type: "bool" }],
+    },
+    {
+      key: "friend", name: "👥 群友模式", desc: "QQ 群里像网友互动（独立文件）",
+      options: [
+        { path: "friend.enabled", label: "开关", type: "bool" },
+        { path: "friend.nickname", label: "称呼", type: "string" },
+        { path: "friend.readOnly", label: "只读", type: "bool" },
+        { path: "friend.blacklist.groups", label: "屏蔽群", type: "array" },
+        { path: "friend.blacklist.users", label: "屏蔽用户", type: "array" },
+      ],
+    },
+    {
+      key: "acl", name: "🔐 访问控制", desc: "谁可指挥（白名单/开放）",
+      options: [
+        { path: "accessControl.mode", label: "模式", type: "enum", values: ["whitelist", "open"] },
+        { path: "accessControl.allowedUsers.feishu", label: "飞书白名单", type: "array" },
+        { path: "accessControl.allowedUsers.qq", label: "QQ 白名单", type: "array" },
+      ],
+    },
+    {
+      key: "memory", name: "🧠 记忆模式", desc: `统一记忆库 ${memoryDir()}`,
+      options: [],
+    },
+    {
+      key: "learn", name: "🎓 学习模式", desc: `知识库 ${knowledgeDir()}`,
+      options: [],
+    },
   ];
-
-  // 读配置：按路径取值（支持 a.b.c）
-  const getByPath = (obj, path) => {
-    return path.split(".").reduce((o, k) => (o === undefined ? undefined : o[k]), obj);
-  };
 
   ctx.tools.register(defineTool({
     name: "settings",
     description:
-      "查看和修改插件配置。对话中提到「配置/功能/设置」时使用。" +
-      "get 列出功能模块清单和配置选项；set <路径> <值> 修改配置（数组可用 + 追加，如 friend.blacklist.groups+=[123]）。" +
-      "修改后需要重启 DSH 生效。",
+      "查看/修改鲸鱼通知插件配置。用户提到「配置」「功能」「设置」「开关」「渠道」「白名单」时使用。"
+      + "get 列模块与当前值；set <路径> <值> 修改（数组用 +=/ -= 增删）；unset <路径> 删回默认。"
+      + "改动通过 configEditor 校验并**立即热生效**（不需要重启）。群友模式走独立文件。",
     parameters: {
       action: {
         type: "string",
         required: true,
-        enum: ["get", "set"],
-        description: "get=查看配置（不带 path 列出全部模块）；set=修改配置。",
+        enum: ["get", "set", "unset"],
+        description: "get=查看；set=修改；unset=恢复默认。",
       },
       path: {
         type: "string",
-        description: "配置路径（点分），如 enableReports、friend.nickname、accessControl.mode、friend.blacklist.groups。",
+        description: "点分配置路径，如 enableReports、defaultChannel、accessControl.mode、accessControl.allowedUsers.qq。",
       },
       value: {
         type: "string",
-        description: "set 时的值。数组追加用 +=[...] 语法，如 friend.blacklist.groups+=[\"123\"]。",
+        description: "set 的值。数组追加/删除写 +=值 或 -=值（多项用逗号分隔）。",
       },
     },
-    output: {
-      schema: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          ok: { type: "boolean", required: true },
-          detail: { type: "string", required: true },
-        },
-      },
-      render: (_args, value) => [{ type: "text", text: value.detail }],
-    },
+    output: OK_OUTPUT,
     async execute(args) {
-      // get：列出模块清单 + 当前配置
+      const friendPath = typeof args.path === "string" && args.path.startsWith("friend.");
+
+      // ── get ──
       if (args.action === "get") {
-        const path = args.path;
-        if (!path) {
-          const lines = ["📋 鲸鱼娘插件配置总览：\n"];
-          for (const mod of MODULES) {
-            lines.push(`${mod.name} ${mod.desc}`);
-            for (const opt of mod.options) {
-              let val;
-              if (opt.value) val = opt.value();
-              else val = getByPath(resolved, opt.path);
-              lines.push(`  · ${opt.label} (${opt.path}): ${JSON.stringify(val ?? "未设置")}`);
+        if (!args.path) {
+          const live = currentConfig();
+          const lines = ["📋 鲸鱼通知配置", ""];
+          for (const mod of moduleList()) {
+            lines.push(`${mod.name} — ${mod.desc}`);
+            for (const option of mod.options) {
+              let value;
+              if (option.path.startsWith("friend.")) {
+                const friend = await readFriendConfig().catch(() => ({}));
+                value = getByPath(friend, option.path.slice("friend.".length));
+              } else {
+                value = getByPath(live, option.path);
+              }
+              lines.push(`  · ${option.label} (${option.path}): ${JSON.stringify(value ?? "(未设置)")}`);
             }
+            lines.push("");
           }
-          lines.push("\n💡 修改示例：settings set enableReports true / settings set friend.blacklist.groups+=[\"123\"]");
+          lines.push(`配置来源：${configEditor ? "profile 的 tool-notify 行（可热改）" : "只读快照（configEditor 不可用）"}`);
+          lines.push("用法：settings set enableReports true / settings set accessControl.allowedUsers.qq+=123456");
           return { ok: true, detail: lines.join("\n") };
         }
-        const val = path.startsWith("friend.") ? await (async () => {
-          const fm = await readFriendConfig();
-          return getByPath(fm, path.slice("friend.".length));
-        })() : getByPath(resolved, path);
-        return { ok: true, detail: `${path} = ${JSON.stringify(val ?? "未设置")}` };
+
+        const value = friendPath
+          ? getByPath(await readFriendConfig().catch(() => ({})), args.path.slice("friend.".length))
+          : getByPath(currentConfig(), args.path);
+        return { ok: true, detail: `${args.path} = ${JSON.stringify(value ?? "(未设置)")}` };
       }
 
-      // set：按路径写配置
+      // ── unset ──
+      if (args.action === "unset") {
+        if (!args.path) return { ok: false, detail: "unset 需要 path。" };
+        if (friendPath) {
+          const friend = await readFriendConfig();
+          deleteByPath(friend, args.path.slice("friend.".length));
+          await writeFriendConfig(friend);
+          return { ok: true, detail: `已清除 ${args.path}` };
+        }
+        if (!configEditor) return { ok: false, detail: "configEditor 不可用，无法修改插件配置。" };
+        const entry = findEntry();
+        if (!entry) return { ok: false, detail: "找不到 tool-notify 配置行（插件是否作为 bundle 安装？）" };
+        try {
+          await configEditor.edit(entry, (current, inherited) => {
+            const next = structuredClone(current ?? {});
+            deleteByPath(next, args.path);
+            // unset == 回到 bundle 默认值
+            const merged = structuredClone(inherited ?? {});
+            for (const key of Object.keys(next)) {
+              if (!(key in merged) && next[key] !== undefined) merged[key] = next[key];
+            }
+            return merged;
+          });
+          return { ok: true, detail: `已把 ${args.path} 恢复为默认值，已生效。` };
+        } catch (error) {
+          return { ok: false, detail: `修改失败：${error instanceof Error ? error.message : String(error)}` };
+        }
+      }
+
+      // ── set ──
       if (args.action === "set") {
         if (!args.path || args.value === undefined) {
           return { ok: false, detail: "set 需要 path 和 value。例：settings set enableReports true" };
         }
-        // 群友模式配置走 friendmode 独立文件（friend.* 路径）
-        if (args.path.startsWith("friend.")) {
-          const fm = await readFriendConfig();
-          const sub = args.path.slice("friend.".length); // enabled / nickname / blacklist.groups ...
-          const isArrayAppend = /\+=\[/.test(args.value);
-          const rawValue = args.value.replace(/^\+=\[/, "").replace(/\]$/, "");
+        const raw = String(args.value);
+        const append = raw.startsWith("+=");
+        const remove = raw.startsWith("-=");
+        const literal = append || remove ? raw.slice(2) : raw;
+
+        // 群友模式：独立 JSON 文件
+        if (friendPath) {
+          const friend = await readFriendConfig();
+          const sub = args.path.slice("friend.".length);
+          const items = () => literal.split(/[,，]/).map((item) => item.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
+
+          if (sub === "blacklist.groups" || sub === "blacklist.users") {
+            const key = sub.endsWith("groups") ? "groups" : "users";
+            friend.blacklist ??= { groups: [], users: [] };
+            const list = friend.blacklist[key] ?? [];
+            for (const item of items()) {
+              if (append) { if (!list.includes(item)) list.push(item); }
+              else if (remove) { const index = list.indexOf(item); if (index >= 0) list.splice(index, 1); }
+              else if (!list.includes(item)) { list.push(item); }
+            }
+            friend.blacklist[key] = list;
+            await writeFriendConfig(friend);
+            await appendFriendMemory({ kind: "system", text: `黑名单 ${key} → ${list.join(",") || "空"}` }).catch(() => {});
+            return { ok: true, detail: `群友黑名单 ${key}: ${list.join(", ") || "（空）"}` };
+          }
+
+          const value = parseValue(literal);
           if (sub === "enabled") {
-            fm.enabled = rawValue === "true";
-            await writeFriendConfig(fm);
-            return { ok: true, detail: `群友模式已${fm.enabled ? "开启" : "关闭"}。` };
+            if (value === true && !friend.nickname) {
+              return { ok: false, detail: "首次开启群友模式要先设称呼：settings set friend.nickname <称呼>" };
+            }
+            friend.enabled = value === true;
+            await writeFriendConfig(friend);
+            return { ok: true, detail: `群友模式已${friend.enabled ? "开启" : "关闭"}${friend.enabled && friend.readOnly ? "（只读）" : ""}。` };
           }
           if (sub === "nickname") {
-            fm.nickname = rawValue.replace(/^['\"]|['\"]$/g, "");
-            await writeFriendConfig(fm);
-            return { ok: true, detail: `群友称呼已设为「${fm.nickname}」。` };
-          }
-          if (sub === "blacklist.groups" || sub === "blacklist.users") {
-            const key = sub === "blacklist.groups" ? "groups" : "users";
-            const list = fm.blacklist[key] ?? [];
-            const items = rawValue.split(",").map((s) => s.replace(/^['\"]|['\"]$/g, "").trim()).filter(Boolean);
-            for (const item of items) {
-              if (isArrayAppend) { if (!list.includes(item)) list.push(item); }
-              else { const idx = list.indexOf(item); if (idx >= 0) list.splice(idx, 1); }
-            }
-            fm.blacklist[key] = list;
-            await writeFriendConfig(fm);
-            await appendFriendMemory({ kind: "system", text: `黑名单${isArrayAppend ? "添加" : "移除"} ${items.join(",")}` }).catch(() => {});
-            return { ok: true, detail: `群友黑名单${isArrayAppend ? "添加" : "移除"} ${items.join(", ")}。当前 ${key}: ${list.join(", ") || "无"}` };
+            friend.nickname = String(value);
+            await writeFriendConfig(friend);
+            return { ok: true, detail: `群友称呼已设为「${friend.nickname}」。` };
           }
           if (sub === "readOnly") {
-            fm.readOnly = rawValue === "true";
-            await writeFriendConfig(fm);
-            return { ok: true, detail: `群友只读模式已${fm.readOnly ? "开启" : "关闭"}。` };
+            friend.readOnly = value === true;
+            await writeFriendConfig(friend);
+            return { ok: true, detail: `群友只读模式已${friend.readOnly ? "开启" : "关闭"}。` };
           }
-          return { ok: false, detail: `未知群友配置路径 ${args.path}。支持: friend.enabled / friend.nickname / friend.readOnly / friend.blacklist.groups / friend.blacklist.users` };
+          setByPath(friend, sub, value);
+          await writeFriendConfig(friend);
+          return { ok: true, detail: `已设置 friend.${sub} = ${JSON.stringify(value)}` };
         }
-        const presetPath = await resolvePresetPath();
-        if (!presetPath) return { ok: false, detail: "无法定位 preset 配置文件。" };
-        const { readFile, writeFile } = await import("node:fs/promises");
+
+        // 主配置
+        if (!configEditor) {
+          return { ok: false, detail: "configEditor 不可用，无法写入插件配置。请直接编辑插件包的 cordis.patch.yml。" };
+        }
+        const entry = findEntry();
+        if (!entry) {
+          return { ok: false, detail: "找不到 tool-notify 配置行。请确认 dsh-whale-notify 以 profile bundle 形式安装。" };
+        }
         try {
-          let content = await readFile(presetPath, "utf8");
-          // 用文本替换处理简单标量 / 数组追加（保留 yml 注释）
-          const isArrayAppend = /\+=\[/.test(args.value);
-          const rawValue = args.value.replace(/^\+=\[/, "").replace(/\]$/, "");
-          let handled = false;
-          // 简单标量替换：path 的最后一段对应 yml 里的键
-          const key = args.path.split(".").pop();
-          const boolVal = rawValue === "true" ? "true" : rawValue === "false" ? "false" : undefined;
-          if (!isArrayAppend && boolVal !== undefined) {
-            const re = new RegExp(`(${key}:\\s*)(true|false)`, "g");
-            if (re.test(content)) {
-              content = content.replace(re, `$1${boolVal}`);
-              handled = true;
+          let applied;
+          await configEditor.edit(entry, (current) => {
+            const next = structuredClone(current ?? {});
+            const existing = getByPath(next, args.path);
+            let value;
+            if (append || remove) {
+              const list = Array.isArray(existing) ? [...existing] : [];
+              const items = literal.split(/[,，]/).map((item) => item.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
+              for (const item of items) {
+                if (append) { if (!list.includes(item)) list.push(item); }
+                else { const index = list.indexOf(item); if (index >= 0) list.splice(index, 1); }
+              }
+              value = list;
+            } else {
+              value = parseValue(literal);
             }
-          }
-          if (!handled && !isArrayAppend && /^[A-Za-z0-9_\-\u4e00-\u9fff]+$/.test(rawValue)) {
-            const re = new RegExp(`(${key}:\\s*)['\"]?[^'\"]*['\"]?`);
-            if (re.test(content)) {
-              content = content.replace(re, `$1'${rawValue}'`);
-              handled = true;
-            }
-          }
-          if (!handled && isArrayAppend) {
-            // 数组追加：找到 key: [...] 列表，插入元素
-            const items = rawValue.split(",").map((s) => s.trim().replace(/^['\"]|['\"]$/g, "")).filter(Boolean);
-            const listRe = new RegExp(`(${key}:\\s*\\[)([\\s\\S]*?)(\\])`);
-            const m = listRe.exec(content);
-            if (m) {
-              const existing = m[2].trim() ? m[2].trim() : "";
-              const newItems = items.map((i) => `'${i}'`).join(", ");
-              const merged = existing ? `${existing}, ${newItems}` : newItems;
-              content = content.replace(listRe, `$1${merged}$3`);
-              handled = true;
-            }
-          }
-          if (!handled) {
-            return { ok: false, detail: `未能自动修改 ${args.path}（路径或格式不支持）。当前值：${JSON.stringify(getByPath(resolved, args.path))}。请手动编辑 preset 文件。` };
-          }
-          await writeFile(presetPath, content, "utf8");
-          return { ok: true, detail: `已修改 ${args.path}。重启 DSH 后生效。` };
+            setByPath(next, args.path, value);
+            applied = value;
+            return next;
+          });
+          await appendLog({ kind: "settings_set", path: args.path, value: applied });
+          return { ok: true, detail: `已设置 ${args.path} = ${JSON.stringify(applied)}，配置已热生效。` };
         } catch (error) {
-          return { ok: false, detail: `修改失败: ${error instanceof Error ? error.message : String(error)}` };
+          return { ok: false, detail: `修改失败：${error instanceof Error ? error.message : String(error)}` };
         }
       }
-      return { ok: false, detail: `未知操作 ${args.action}。` };
+
+      return { ok: false, detail: `未知操作 ${args.action}` };
     },
-    presentCall: (args) => ({
-      card: "generic",
-      title: "Settings",
-      kind: "other",
-      rawInput: args.action + (args.path ? " " + args.path : ""),
-    }),
+    presentCall: (args) => ({ card: "generic", title: "Settings", kind: "other", rawInput: `${args.action} ${args.path ?? ""}`.trim() }),
   }));
-  // 知识库目录：$DSH_HOME/knowledge/（默认 ~/.dsh/knowledge），markdown 文档持久保存。
+
+  // ────────────────────────── 工具：知识库 ──────────────────────────
   ctx.tools.register(defineTool({
     name: "learn_skill",
     description:
-      "记录一个新学会的技能或知识到知识库。当用户确认要把某个方法/经验/流程记下来时使用。" +
-      "保存为 markdown 文档，下次可用 recall_skill 搜索调取。",
+      "把一条技能/经验记进知识库（$DSH_HOME/knowledge/，markdown）。用户确认「记下来/以后照着做」时使用，"
+      + "之后可用 recall_skill 搜回。",
     parameters: {
-      title: {
-        type: "string",
-        required: true,
-        description: "技能/知识名称，例如「飞书发消息的方法」「项目的构建命令」。",
-      },
-      content: {
-        type: "string",
-        required: true,
-        description: "详细内容：步骤、命令、要点等，markdown 格式。",
-      },
-      tags: {
-        type: "array",
-        description: "可选标签，便于搜索（如 ['飞书', '通知']）。",
-        items: { type: "string" },
-      },
+      title: { type: "string", required: true, description: "技能名称，例如「部署 DSH 插件包」。" },
+      content: { type: "string", required: true, description: "详细内容：步骤、命令、坑点，markdown。" },
+      tags: { type: "array", description: "可选标签，便于检索。", items: { type: "string" } },
     },
     output: {
       schema: {
         type: "object",
         additionalProperties: false,
-        properties: {
-          saved: { type: "boolean", required: true },
-          path: { type: "string", required: true },
-        },
+        properties: { saved: { type: "boolean", required: true }, path: { type: "string", required: true } },
       },
-      render: (_args, value) => [{ type: "text", text: value.saved ? `已保存到知识库：${value.path}` : `保存失败` }],
+      render: (_args, value) => [{ type: "text", text: value.saved ? `已存入知识库：${value.path}` : "保存失败" }],
     },
     async execute(args) {
       const path = await saveSkill(args.title, args.content, args.tags ?? []);
-      await appendLog({ ts: new Date().toISOString(), kind: "learn_skill", title: args.title, path }).catch(() => {});
+      await appendLog({ kind: "learn_skill", title: args.title, path });
       return { saved: true, path };
     },
-    presentCall: (args) => ({
-      card: "generic",
-      title: "Learn skill",
-      kind: "other",
-      rawInput: args.title,
-    }),
+    presentCall: (args) => ({ card: "generic", title: "Learn skill", kind: "other", rawInput: args.title }),
   }));
 
   ctx.tools.register(defineTool({
     name: "recall_skill",
     description:
-      "从知识库搜索之前记录过的技能/知识（learn_skill 保存的内容）。" +
-      "当用户提到「上次是怎么做的」「我记得学过」或需要某个已记录方法时使用。",
+      "从知识库搜索之前记录的技能/经验（learn_skill 保存的内容）。用户说「上次是怎么做的」「我记得学过」时使用。",
     parameters: {
-      query: {
-        type: "string",
-        required: true,
-        description: "搜索关键词，例如「飞书」「构建」「正则」。留空列出全部。",
-      },
+      query: { type: "string", required: true, description: "关键词；留空列出全部。" },
     },
     output: {
       schema: {
@@ -1651,96 +1439,198 @@ function apply(ctx, config) {
       render: (_args, value) => [{
         type: "text",
         text: value.found
-          ? value.results.map((r) => `📄 ${r.title}\n   ${r.snippet}`).join("\n\n")
-          : `知识库中未找到「${_args.query}」相关内容。`,
+          ? value.results.map((row) => `📄 ${row.title}\n   ${row.snippet}\n   ${row.path}`).join("\n\n")
+          : value.detail,
       }],
     },
     async execute(args) {
-      const results = await searchSkills(args.query, 5);
+      const results = await searchSkills(args.query, 8);
       if (results.length === 0) {
-        return { found: false, results: [], detail: `未找到匹配「${args.query}」的技能。知识库目录：${knowledgeDir()}` };
+        return { found: false, results: [], detail: `知识库中未找到「${args.query}」（目录：${knowledgeDir()}）` };
       }
-      return { found: true, results, detail: `找到 ${results.length} 条：${results.map((r) => r.title).join("、")}` };
+      return { found: true, results, detail: `找到 ${results.length} 条：${results.map((row) => row.title).join("、")}` };
     },
-    presentCall: (args) => ({
-      card: "generic",
-      title: "Recall skill",
-      kind: "other",
-      rawInput: args.query,
-    }),
+    presentCall: (args) => ({ card: "generic", title: "Recall skill", kind: "other", rawInput: args.query }),
   }));
 
-  // ── save_memory：保存当前会话为记忆文档（统一记忆库）──
-  // 用户说「保存记忆/记住这个」或会话结束总结时，压缩当前内容存为 markdown。
+  // ────────────────────────── 工具：save_memory ──────────────────────────
   ctx.tools.register(defineTool({
     name: "save_memory",
     description:
-      "把当前对话/任务总结保存到统一记忆库。用户说「保存记忆」「记住这个」「总结一下存起来」时使用。" +
-      "先概括本次会话的要点（结论/步骤/偏好），再调用本工具存为文档，下次可用 recall_memory 搜到。" +
-      "类别 conversations=跨会话记忆（默认）；summaries=手动总结。",
+      "把当前会话/任务的要点存进统一记忆库（markdown，$DSH_HOME/memory/）。"
+      + "用户说「保存记忆」「记住这个」「总结一下存起来」，或一段工作收尾时使用。"
+      + "先压缩成要点（结论/步骤/偏好），不要贴原文。",
     parameters: {
-      title: {
-        type: "string",
-        required: true,
-        description: "记忆标题，如「股市复盘-2026-08-14」「项目的部署步骤」。",
-      },
-      content: {
-        type: "string",
-        required: true,
-        description: "总结内容（markdown）：结论、关键步骤、用户偏好等，压缩成要点而非原文。",
-      },
+      title: { type: "string", required: true, description: "记忆标题，如「插件包安装踩坑-2026-10-18」。" },
+      content: { type: "string", required: true, description: "要点（markdown）。" },
       category: {
         type: "string",
         description: "conversations（跨会话记忆，默认）或 summaries（手动总结）。",
         enum: ["conversations", "summaries"],
       },
-      tags: {
-        type: "array",
-        description: "可选标签便于搜索，如 ['股市', '复盘']。",
-        items: { type: "string" },
-      },
+      tags: { type: "array", description: "可选标签。", items: { type: "string" } },
     },
     output: {
       schema: {
         type: "object",
         additionalProperties: false,
-        properties: {
-          saved: { type: "boolean", required: true },
-          path: { type: "string", required: true },
-        },
+        properties: { saved: { type: "boolean", required: true }, path: { type: "string", required: true } },
       },
       render: (_args, value) => [{ type: "text", text: value.saved ? `✅ 已存入记忆库：${value.path}` : "保存失败" }],
     },
     async execute(args) {
       const path = await saveMemoryDoc(args.category ?? "conversations", args.title, args.content, args.tags ?? []);
-      await appendLog({ ts: new Date().toISOString(), kind: "save_memory", title: args.title, path }).catch(() => {});
+      await appendLog({ kind: "save_memory", title: args.title, path });
       return { saved: true, path };
     },
-    presentCall: (args) => ({
-      card: "generic",
-      title: "Save memory",
-      kind: "other",
-      rawInput: args.title,
-    }),
+    presentCall: (args) => ({ card: "generic", title: "Save memory", kind: "other", rawInput: args.title }),
   }));
 
-  // ── friend_mode：群友模式（对话内开启/称呼/黑名单）──
+  // ────────────────────────── 工具：friend_mode ──────────────────────────
   ctx.tools.register(defineTool({
     name: "friend_mode",
     description:
-      "管理「群友模式」：在 QQ 群里像真实网友一样互动。可开启/关闭、设置称呼、管理黑名单。" +
-      "开启时需先确认是否切换到只读模式；首次开启会询问用户想让大家怎么称呼你。" +
-      "群友模式有独立的聊天记忆和回复风格提示词（存于 $DSH_HOME/friendmode/，可编辑）。",
+      "管理「群友模式」：QQ 群里像真实网友一样互动。可开关、设称呼、管理屏蔽群/用户。"
+      + "独立记忆与回复风格（$DSH_HOME/friendmode/prompts.md）。首次开启必须先设称呼。",
     parameters: {
       action: {
         type: "string",
         required: true,
-        enum: ["on", "off", "set_nickname", "block_group", "unblock_group", "block_user", "unblock_user", "status"],
-        description: "on=开启；off=关闭；set_nickname=设置称呼；block_group=屏蔽群；unblock_group=取消屏蔽群；block_user=屏蔽用户；unblock_user=取消屏蔽用户；status=查看状态。",
+        enum: ["on", "off", "set_nickname", "block_group", "unblock_group", "block_user", "unblock_user", "set_readonly", "status", "prompt"],
+        description: "on/off=开关；set_nickname=设称呼；block_*/unblock_*=黑名单；set_readonly=只读；status=状态；prompt=看/改提示词。",
       },
-      value: {
+      value: { type: "string", description: "set_nickname 填称呼；block_* 填群号/QQ号；set_readonly 填 true/false；prompt 填新提示词（留空=查看）。" },
+    },
+    output: OK_OUTPUT,
+    async execute(args) {
+      const config = await readFriendConfig();
+      switch (args.action) {
+        case "on": {
+          if (!config.nickname) {
+            return { ok: false, detail: "首次开启群友模式需要先设置称呼：先问用户想让大家怎么称呼，再 friend_mode(set_nickname, 称呼)，然后重新开启。" };
+          }
+          if (config.readOnly === undefined) config.readOnly = false;
+          config.enabled = true;
+          await writeFriendConfig(config);
+          await appendFriendMemory({ kind: "system", text: "群友模式已开启" }).catch(() => {});
+          return { ok: true, detail: `群友模式已开启（称呼「${config.nickname}」，只读：${config.readOnly ? "是" : "否"}）。配置目录 ${friendModeDir()}` };
+        }
+        case "off": {
+          config.enabled = false;
+          await writeFriendConfig(config);
+          await appendFriendMemory({ kind: "system", text: "群友模式已关闭" }).catch(() => {});
+          return { ok: true, detail: "群友模式已关闭。" };
+        }
+        case "set_nickname": {
+          if (!args.value) return { ok: false, detail: "请提供称呼（value）。" };
+          config.nickname = String(args.value).trim();
+          await writeFriendConfig(config);
+          return { ok: true, detail: `称呼已设为「${config.nickname}」。群里提到该称呼时会回应。` };
+        }
+        case "set_readonly": {
+          config.readOnly = String(args.value ?? "true") !== "false";
+          await writeFriendConfig(config);
+          return { ok: true, detail: `群友只读模式已${config.readOnly ? "开启" : "关闭"}。` };
+        }
+        case "block_group":
+        case "unblock_group":
+        case "block_user":
+        case "unblock_user": {
+          if (!args.value) return { ok: false, detail: `请提供${args.action.includes("group") ? "群号" : "QQ 号"}。` };
+          const key = args.action.includes("group") ? "groups" : "users";
+          config.blacklist ??= { groups: [], users: [] };
+          const list = config.blacklist[key] ?? [];
+          const target = String(args.value);
+          if (args.action.startsWith("block")) {
+            if (!list.includes(target)) list.push(target);
+            config.blacklist[key] = list;
+            await writeFriendConfig(config);
+            return { ok: true, detail: `已屏蔽${key === "groups" ? "群" : "用户"} ${target}。` };
+          }
+          config.blacklist[key] = list.filter((item) => item !== target);
+          await writeFriendConfig(config);
+          return { ok: true, detail: `已取消屏蔽${key === "groups" ? "群" : "用户"} ${target}。` };
+        }
+        case "prompt": {
+          if (args.value) {
+            const { mkdir: mkdirFs, writeFile: writeFs } = await import("node:fs/promises");
+            await mkdirFs(friendModeDir(), { recursive: true });
+            await writeFs(join(friendModeDir(), "prompts.md"), String(args.value), "utf8");
+            return { ok: true, detail: "群友回复提示词已更新。" };
+          }
+          const prompt = await readFriendPrompts();
+          return { ok: true, detail: `当前提示词（${join(friendModeDir(), "prompts.md")}）：\n\n${prompt || DEFAULT_PROMPTS}` };
+        }
+        case "status": {
+          return {
+            ok: true,
+            detail: [
+              `群友模式：${config.enabled ? "已开启" : "已关闭"}`,
+              `称呼：${config.nickname || "未设置"}`,
+              `只读：${config.readOnly ? "是" : "否"}`,
+              `屏蔽群：${(config.blacklist?.groups ?? []).join(", ") || "无"}`,
+              `屏蔽用户：${(config.blacklist?.users ?? []).join(", ") || "无"}`,
+              `配置：${join(friendModeDir(), "config.json")}`,
+            ].join("\n"),
+          };
+        }
+        default:
+          return { ok: false, detail: `未知操作 ${args.action}` };
+      }
+    },
+    presentCall: (args) => ({ card: "generic", title: "Friend mode", kind: "other", rawInput: args.action }),
+  }));
+
+  // ────────────────────────── 工具：plugin_tools ──────────────────────────
+  // 让模型能「看见并调用」宿主上其它插件的工具。
+  // 为什么需要：模型默认只看到工具名 + 参数，看不到工具属于哪个插件、要不要前置条件
+  // （比如 db_query 必须先 db_connect），也不知道某个工具是被 preset 的 restrict 挡掉的。
+  // 这里给它一张带注释的清单，以及一个能在同一轮里连续调多个工具的入口。
+  ctx.tools.register(defineTool({
+    name: "plugin_tools",
+    description:
+      "查看并调用宿主上其他插件的工具。list 按插件/能力分类列出本会话可用的工具（含所属插件、前置条件、典型用法）；"
+      + "call 以当前会话身份连续调用 1-8 个工具（走完整审批与策略管线，等价于你自己直接调，但省掉多轮往返）。"
+      + "当用户提到某个能力（数据库、SSH、Office、单位换算…）而你不确定用哪个工具时，先 list；"
+      + "当一步操作需要「先准备再执行」（例如 db_connect → db_query）时，用 call 把两步一次做完。",
+    parameters: {
+      action: {
         type: "string",
-        description: "set_nickname 时填称呼；block_group/unblock_group 时填群号；block_user/unblock_user 时填 QQ 号。",
+        required: true,
+        enum: ["list", "call"],
+        description: "list=查看可用工具清单；call=调用工具。",
+      },
+      group: {
+        type: "string",
+        description: "list 用：只看某一类，例如 SSH / 数据库 / 文件 / 通知 / 文档。",
+      },
+      keyword: {
+        type: "string",
+        description: "list 用：按关键词过滤（工具名、插件名、用途都能匹配）。",
+      },
+      include_unavailable: {
+        type: "boolean",
+        description: "list 用：连本会话看不到的工具也列出来（用来解释「为什么没有这个工具」）。",
+      },
+      steps: {
+        type: "array",
+        description:
+          "call 用：按顺序执行的步骤。前一步的返回值可以用 $0.field / $1.field 引用到后一步的参数里"
+          + "（例如第 0 步 db_connect 返回 db_connection_id，第 1 步传 \"$0.db_connection_id\"）。",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          // 注意：这里只能用属性级 required（`required: true`），
+          // 不能写 items 级的 required 数组 —— 旧版 dsh-tools 的 schema DSL 不认它。
+          properties: {
+            tool: { type: "string", required: true, description: "工具名，例如 db_query。" },
+            arguments: { type: "string", description: "参数：JSON 对象字符串，例如 {\"sql\":\"select 1\"}。" },
+          },
+        },
+      },
+      stop_on_error: {
+        type: "boolean",
+        description: "call 用：某一步失败就停下（默认 true）。设 false 会继续跑完剩余步骤。",
       },
     },
     output: {
@@ -1748,69 +1638,163 @@ function apply(ctx, config) {
         type: "object",
         additionalProperties: false,
         properties: {
-          ok: { type: "boolean", required: true },
           detail: { type: "string", required: true },
+          results: {
+            type: "array",
+            required: true,
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                tool: { type: "string", required: true },
+                ok: { type: "boolean", required: true },
+                isError: { type: "boolean", required: true },
+                output: { type: "string", required: true },
+              },
+            },
+          },
         },
       },
       render: (_args, value) => [{ type: "text", text: value.detail }],
     },
-    async execute(args) {
-      const config = await readFriendConfig();
-      switch (args.action) {
-        case "on": {
-          if (!config.nickname) {
-            return { ok: false, detail: "首次开启群友模式需要先设置称呼——请先问用户想让大家怎么称呼，再调用 friend_mode(action: set_nickname, value: 称呼)，然后重新开启。" };
+    async execute(args, exec) {
+      const tools = ctx.get("tools") ?? ctx.tools;
+
+      // ── list ──
+      if (args.action === "list") {
+        const inventory = buildInventory(tools, exec.agent);
+        if (inventory.entries.length === 0) {
+          return { detail: "宿主注册表里没有任何工具（tools 服务不可用？）", results: [] };
+        }
+        const hidden = inventory.entries.filter((entry) => !entry.visible);
+        const sections = summarizeInventory(inventory.entries, {
+          group: args.group,
+          keyword: args.keyword,
+          onlyVisible: args.include_unavailable !== true,
+        });
+
+        const lines = [
+          `## 本会话可用的工具：${inventory.visibleCount} / 注册总数 ${inventory.entries.length}`,
+          "",
+        ];
+        for (const section of sections) {
+          lines.push(`### ${section.group}`);
+          for (const entry of section.entries) {
+            const params = entry.requiredParams.length > 0 ? ` 必需参数：${entry.requiredParams.join(", ")}` : "";
+            const owner = entry.owner ? `〔${entry.owner}〕` : "";
+            lines.push(`- ${entry.name} ${owner}${entry.hint ? ` — ${entry.hint}` : ""}${params}`);
+            if (entry.prereq) lines.push(`    前置：${entry.prereq}`);
+            if (!entry.visible) lines.push("    ⚠️ 当前会话看不到它（被 restrict 挡掉或插件未启用）");
           }
-          config.enabled = true;
-          await writeFriendConfig(config);
-          await appendFriendMemory({ kind: "system", text: "群友模式已开启" });
-          return { ok: true, detail: `群友模式已开启（昵称「${config.nickname}」，只读：${config.readOnly ? "是" : "否"}）。群友模式文件在 ${friendModeDir()}` };
+          lines.push("");
         }
-        case "off": {
-          config.enabled = false;
-          await writeFriendConfig(config);
-          await appendFriendMemory({ kind: "system", text: "群友模式已关闭" });
-          return { ok: true, detail: "群友模式已关闭。" };
+        if (hidden.length > 0 && args.include_unavailable !== true) {
+          lines.push(`另有 ${hidden.length} 个工具对本会话不可见（加 include_unavailable: true 查看）。`);
         }
-        case "set_nickname": {
-          if (!args.value) return { ok: false, detail: "请提供称呼（value 参数）。" };
-          config.nickname = String(args.value);
-          await writeFriendConfig(config);
-          await appendFriendMemory({ kind: "system", text: `称呼设置为 ${config.nickname}` });
-          return { ok: true, detail: `称呼已设置为「${config.nickname}」。在群聊中别人提到该称呼时你会回应。` };
-        }
-        case "block_group": case "unblock_group": case "block_user": case "unblock_user": {
-          if (!args.value) return { ok: false, detail: `请提供${args.action.includes("group") ? "群号" : "QQ号"}（value 参数）。` };
-          const key = args.action.includes("group") ? "groups" : "users";
-          const list = config.blacklist[key] ?? [];
-          if (args.action.startsWith("block")) {
-            if (!list.includes(String(args.value))) list.push(String(args.value));
-            config.blacklist[key] = list;
-            await writeFriendConfig(config);
-            return { ok: true, detail: `已屏蔽${args.action.includes("group") ? "群" : "用户"} ${args.value}。` };
-          } else {
-            config.blacklist[key] = list.filter((x) => x !== String(args.value));
-            await writeFriendConfig(config);
-            return { ok: true, detail: `已取消屏蔽${args.action.includes("group") ? "群" : "用户"} ${args.value}。` };
-          }
-        }
-        case "status": {
-          return {
-            ok: true,
-            detail: `群友模式：${config.enabled ? "已开启" : "已关闭"} | 称呼：${config.nickname || "未设置"} | 只读：${config.readOnly ? "是" : "否"} | 屏蔽群：${(config.blacklist?.groups ?? []).join(", ") || "无"} | 屏蔽用户：${(config.blacklist?.users ?? []).join(", ") || "无"}`,
-          };
-        }
-        default:
-          return { ok: false, detail: `未知操作 ${args.action}。` };
+        lines.push("要连续调用多步，用 plugin_tools(action: \"call\", steps: [{tool, arguments}, …])。");
+        return { detail: lines.join("\n"), results: [] };
       }
+
+      // ── call ──
+      if (args.action === "call") {
+        const steps = Array.isArray(args.steps) ? args.steps : [];
+        if (steps.length === 0) {
+          return { detail: "call 需要至少一个 step（{tool, arguments}）。", results: [] };
+        }
+        if (steps.length > MAX_BATCH) {
+          return { detail: `一次最多 ${MAX_BATCH} 步（收到 ${steps.length} 步），请拆成几次调用。`, results: [] };
+        }
+
+        const stopOnError = args.stop_on_error !== false;
+        const results = [];
+        /** 按索引保存每一步的规范值，供后续 $N.path 引用。 */
+        const values = [];
+        /** 自动纠正过的引用（字段名风格不一致时）。 */
+        const corrections = [];
+
+        for (const [index, step] of steps.entries()) {
+          const name = String(step?.tool ?? "").trim();
+          if (name === "") {
+            results.push({ tool: "(空)", ok: false, isError: true, output: "step 缺少 tool。" });
+            if (stopOnError) break;
+            continue;
+          }
+
+          let parsed;
+          const notes = [];
+          try {
+            parsed = parseStepArguments(step?.arguments, values, notes);
+          } catch (error) {
+            results.push({
+              tool: name, ok: false, isError: true,
+              output: `参数不是合法 JSON：${error instanceof Error ? error.message : String(error)}`,
+            });
+            if (stopOnError) break;
+            continue;
+          }
+
+          const outcome = await callTool(tools, {
+            agent: exec.agent,
+            signal: exec.signal,
+            parentToken: exec.token,
+            rootCallId: exec.callId,
+            depth: 0,
+          }, name, parsed);
+
+          // 把这一跳的规范值留给后续步骤做 $N.path 引用；失败就没有规范值。
+          values[index] = outcome.value;
+          results.push({
+            tool: name,
+            ok: outcome.ok,
+            isError: outcome.isError,
+            output: outcome.text,
+          });
+          // 纠正记录不能塞进 results（output schema 声明了 additionalProperties: false），
+          // 单独攒一份，最后统一打印。
+          if (notes.length > 0) corrections.push(...notes);
+          if (outcome.isError && stopOnError) break;
+        }
+
+        const failed = results.filter((row) => row.isError || !row.ok).length;
+        const lines = [`## 调用 ${results.length} 个工具，失败 ${failed} 个`, ""];
+        for (const [index, row] of results.entries()) {
+          // 三态：成功 / 执行失败（真的跑了但报错或参数不合法）/ 未执行（前面失败后中断）
+          const state = row.isError || !row.ok ? "失败" : "成功";
+          lines.push(`### ${index + 1}. ${row.tool} — ${state}`);
+          lines.push(row.output);
+          lines.push("");
+        }
+        // 字段名风格不一致导致的「自动纠正」要显式说出来，否则模型下次还会写错。
+        if (corrections.length > 0) {
+          lines.push(`ℹ️ 自动纠正的引用：${corrections.join("；")}`);
+          lines.push("");
+        }
+        if (failed > 0 && stopOnError && results.length < steps.length) {
+          lines.push(`（第 ${results.length + 1} 步起未执行：stop_on_error 默认在首次失败后中断；要跑完全部步骤传 stop_on_error: false。）`);
+        }
+        return { detail: lines.join("\n"), results };
+      }
+
+      return { detail: `未知 action ${args.action}（只支持 list / call）。`, results: [] };
     },
     presentCall: (args) => ({
       card: "generic",
-      title: "Friend mode",
+      title: "Plugin tools",
       kind: "other",
       rawInput: args.action,
     }),
   }));
+
+  // 启动日志：一眼看出这版插件在什么状态下起来的
+  appendLog({
+    kind: "plugin_start",
+    build: BUILD_TAG,
+    channels: configuredChannels(resolved, env),
+    acl: acl.mode,
+    reports: reports.length,
+    feishu: state.feishu.status,
+    qq: qqConfig ? "configured" : "off",
+  }).catch(() => {});
 }
 
 export { Config, apply, inject, name };

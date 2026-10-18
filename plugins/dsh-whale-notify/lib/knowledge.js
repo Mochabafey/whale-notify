@@ -5,9 +5,8 @@ import { randomUUID } from "node:crypto";
 /**
  * @module dsh-whale-notify/knowledge
  *
- * Persistent skill/knowledge library for the whale-girl learning feature.
- * Skills are stored as markdown documents under `$DSH_HOME/knowledge/`
- * (default `~/.dsh/knowledge`), so they survive plugin updates and restarts.
+ * 技能/知识库：markdown 文档存在 `$DSH_HOME/knowledge/`。
+ * 与记忆库分开 —— 记忆是「发生过什么」，知识是「以后该怎么做」。
  */
 
 /** Resolve the knowledge base directory. */
@@ -27,29 +26,40 @@ function slugify(title) {
 }
 
 /**
- * Save one skill document. Appends a short unique suffix to avoid collisions.
- * @param title - skill name/title.
- * @param content - markdown body describing the skill.
- * @param tags - optional keywords for searching.
+ * Save one skill document.
+ * @param title - skill name.
+ * @param content - markdown body.
+ * @param tags - optional keywords (indexed by search).
  * @returns the saved file path.
  */
 export async function saveSkill(title, content, tags = []) {
   const dir = knowledgeDir();
   await mkdir(dir, { recursive: true });
-  const stamp = randomUUID().slice(0, 6);
-  const filename = `${slugify(title)}-${stamp}.md`;
-  const path = join(dir, filename);
+  const path = join(dir, `${slugify(title)}-${randomUUID().slice(0, 6)}.md`);
   const tagLine = Array.isArray(tags) && tags.length > 0 ? `tags: ${tags.join(", ")}\n` : "";
-  const doc = `# ${title}\n\n${tagLine}---\n\n${content}\n`;
-  await writeFile(path, doc, "utf8");
+  await writeFile(path, `# ${title}\n\n${tagLine}---\n\n${content}\n`, "utf8");
   return path;
 }
 
+/** Count non-overlapping occurrences (both sides already lowercased). */
+function countOccurrences(haystack, needle) {
+  if (needle === "") return 0;
+  let count = 0;
+  let index = haystack.indexOf(needle);
+  while (index !== -1 && count < 30) {
+    count += 1;
+    index = haystack.indexOf(needle, index + needle.length);
+  }
+  return count;
+}
+
 /**
- * Search the knowledge base by keyword (title / tags / content substring).
- * @param query - search keyword (empty = list all).
+ * Search the knowledge base.
+ *
+ * 多个关键词（空格分隔）按 AND 处理；标题/标签命中权重高于正文。
+ * @param query - keyword(s); empty lists everything.
  * @param limit - max results.
- * @returns array of { title, path, snippet }.
+ * @returns array of { title, path, snippet, score }.
  */
 export async function searchSkills(query, limit = 5) {
   const dir = knowledgeDir();
@@ -59,26 +69,46 @@ export async function searchSkills(query, limit = 5) {
   } catch {
     return [];
   }
-  const needle = String(query ?? "").toLowerCase();
+  const terms = String(query ?? "").toLowerCase().split(/\s+/).filter(Boolean);
   const results = [];
   for (const filename of files) {
     if (!filename.endsWith(".md")) continue;
     const path = join(dir, filename);
     try {
       const text = await readFile(path, "utf8");
-      const title = /^#\s+(.+)$/m.exec(text)?.[1] ?? filename.replace(/\.md$/, "");
-      if (needle !== "" && !text.toLowerCase().includes(needle) && !title.toLowerCase().includes(needle)) continue;
-      const snippet = text.slice(0, 200).replace(/\n+/g, " ");
-      results.push({ title, path, snippet });
-      if (results.length >= limit) break;
+      const lower = text.toLowerCase();
+      const title = /^#\s+(.+)$/m.exec(text)?.[1]?.trim() ?? filename.replace(/\.md$/, "");
+      const lowerTitle = title.toLowerCase();
+      const tags = (/^tags:\s*(.+)$/m.exec(text)?.[1] ?? "").toLowerCase();
+
+      let score = 0;
+      let matchedAll = true;
+      for (const term of terms) {
+        const inTitle = lowerTitle.includes(term);
+        const inTags = tags.includes(term);
+        const inBody = countOccurrences(lower, term);
+        if (!inTitle && !inTags && inBody === 0) { matchedAll = false; break; }
+        score += (inTitle ? 100 : 0) + (inTags ? 40 : 0) + Math.min(inBody, 10) * 3;
+      }
+      if (!matchedAll) continue;
+
+      const bodyStart = text.search(/^---\s*$/m);
+      const snippetSource = bodyStart >= 0 ? text.slice(bodyStart + 4) : text;
+      results.push({
+        title,
+        path,
+        score,
+        snippet: snippetSource.replace(/\s+/g, " ").trim().slice(0, 220),
+      });
     } catch {
-      // skip unreadable file
+      // 跳过读不出的文件
     }
   }
-  return results;
+  results.sort((a, b) => b.score - a.score);
+  return results.slice(0, limit);
 }
 
-/** Read the full content of a skill document by path. */
+/** Read a full skill document by path. */
 export async function readSkill(path) {
   return await readFile(path, "utf8");
 }

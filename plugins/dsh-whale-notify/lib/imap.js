@@ -1,14 +1,10 @@
 /**
  * @module dsh-whale-notify/imap
  *
- * IMAP polling + reply parsing for the `notify` tool's reply/approval loop.
- * Polls the configured inbox for replies whose subject carries a decision id
- * (`[DSH:<id>]`), extracts the plain-text reply body, and returns the parsed
- * replies. Pure JS MIME parsing for the body; imapflow handles the wire.
+ * IMAP 轮询与回复解析，供邮件问答/回复指挥使用。
  *
- * `imapflow` is an optional runtime dependency, loaded lazily on first use:
- * a profile without it must still load this plugin (the rest of the channels
- * keep working) and only the IMAP features report a clear error.
+ * 只做三件事：连上收件箱 → 找到主题里带 `[DSH:<id>]` 的回信 → 解析出正文。
+ * `imapflow` 是可选的懒加载依赖：缺了它只有邮件功能报错，插件照常加载。
  */
 
 /** Cached lazy loader for the optional `imapflow` dependency. */
@@ -33,10 +29,7 @@ export function extractDecisionId(subject) {
   return match ? match[1] : undefined;
 }
 
-/**
- * Decode one MIME word (`=?charset?B?...?=` or `=?charset?Q?...?=`) sequence.
- * Falls back to the raw string when decoding fails.
- */
+/** Decode `=?charset?B?...?=` / `=?charset?Q?...?=` encoded words. */
 function decodeMimeWords(value) {
   if (typeof value !== "string") return value;
   const pattern = /=\?([^?]+)\?([BbQq])\?([^?]*)\?=/g;
@@ -51,9 +44,13 @@ function decodeMimeWords(value) {
     try {
       const bytes = encoding.toLowerCase() === "b"
         ? Buffer.from(payload, "base64")
-        : Buffer.from(payload.replace(/_/g, " "), "base64");
-      const text = new TextDecoder(charset || "utf-8").decode(bytes);
-      output += text;
+        : Buffer.from(
+            payload
+              .replace(/_/g, " ")
+              .replace(/=([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+            "binary",
+          );
+      output += new TextDecoder(charset || "utf-8").decode(bytes);
     } catch {
       output += match[0];
     }
@@ -64,9 +61,10 @@ function decodeMimeWords(value) {
 
 /**
  * Extract the plain-text body from a raw RFC 5322 message.
- * Handles text/plain parts, quoted-printable/base64 transfer encodings,
- * and multipart/alternative (prefers text/plain over text/html).
- * @param raw - the raw message buffer.
+ * Handles text/plain, quoted-printable/base64 transfer encodings, and
+ * multipart (prefers the first text/plain part; falls back to HTML stripped).
+ *
+ * @param raw - raw message buffer or string.
  * @returns the decoded plain-text body, or "" when none is found.
  */
 export function extractBody(raw) {
@@ -80,28 +78,51 @@ export function extractBody(raw) {
   const boundary = /boundary="?([^";]+)"?/i.exec(contentType);
 
   if (boundary) {
-    // Multipart: split on boundary, take the first text/plain part.
     const delimiter = `--${boundary[1]}`;
     const parts = source.slice(bodyStart).split(delimiter);
+    let htmlFallback = "";
     for (const part of parts) {
-      if (part.startsWith("--")) continue; // trailing -- terminator
+      if (part.startsWith("--")) continue; // terminator
       const partHeaderEnd = part.indexOf("\r\n\r\n");
       if (partHeaderEnd === -1) continue;
       const partHeaders = part.slice(0, partHeaderEnd);
-      const partContentType = headerValue(partHeaders, "content-type");
-      if (!/text\/plain/i.test(partContentType)) continue;
+      const partType = headerValue(partHeaders, "content-type");
+      const encoding = headerValue(partHeaders, "content-transfer-encoding");
       const partBody = part.slice(partHeaderEnd + 4).replace(/\r\n$/, "");
-      return decodeTransfer(partBody, headerValue(partHeaders, "content-transfer-encoding"));
+      if (/text\/plain/i.test(partType)) {
+        return decodeTransfer(partBody, encoding).trim();
+      }
+      if (htmlFallback === "" && /text\/html/i.test(partType)) {
+        htmlFallback = stripHtml(decodeTransfer(partBody, encoding));
+      }
+    }
+    return htmlFallback.trim();
+  }
+
+  if (!/text\/plain/i.test(contentType)) {
+    if (/text\/html/i.test(contentType)) {
+      return stripHtml(decodeTransfer(source.slice(bodyStart), headerValue(headersText, "content-transfer-encoding"))).trim();
     }
     return "";
   }
-
-  if (!/text\/plain/i.test(contentType)) return "";
-  const body = source.slice(bodyStart);
-  return decodeTransfer(body, headerValue(headersText, "content-transfer-encoding"));
+  return decodeTransfer(source.slice(bodyStart), headerValue(headersText, "content-transfer-encoding")).trim();
 }
 
-/** Extract one header value by lowercased name (may span continuation lines). */
+/** Crude HTML → text (only used when the sender has no text/plain part). */
+function stripHtml(html) {
+  return String(html)
+    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li|tr)>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/\n{3,}/g, "\n\n");
+}
+
+/** Extract one header value by lowercased name (handles continuation lines). */
 function headerValue(headersText, name) {
   const lines = headersText.split("\r\n");
   const normalized = [];
@@ -120,38 +141,41 @@ function headerValue(headersText, name) {
 /** Decode a body by its transfer encoding (quoted-printable / base64 / 8bit). */
 function decodeTransfer(body, encoding) {
   const enc = String(encoding || "").trim().toLowerCase();
-  let text;
-  if (enc === "base64") {
-    text = Buffer.from(body.replace(/\s+/g, ""), "base64").toString("utf8");
-  } else if (enc === "quoted-printable") {
-    text = body
-      .replace(/=\r?\n/g, "") // soft line breaks
-      .replace(/=([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
-      .replace(/=([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
-  } else {
-    text = body;
+  if (enc === "base64") return Buffer.from(body.replace(/\s+/g, ""), "base64").toString("utf8");
+  if (enc === "quoted-printable") {
+    // 先按字节还原，再按 UTF-8 解码 —— 直接 String.fromCharCode 会把中文拆坏。
+    const bytes = [];
+    const text = body.replace(/=\r?\n/g, "");
+    for (let index = 0; index < text.length; index += 1) {
+      const char = text[index];
+      if (char === "=" && /^[0-9A-Fa-f]{2}$/.test(text.slice(index + 1, index + 3))) {
+        bytes.push(parseInt(text.slice(index + 1, index + 3), 16));
+        index += 2;
+      } else {
+        bytes.push(...Buffer.from(char, "utf8"));
+      }
+    }
+    return Buffer.from(bytes).toString("utf8");
   }
-  return text.trim();
+  return body;
 }
 
 /**
- * Normalize a reply body: strip the quoted original (lines starting with ">"),
- * common reply separators, signatures (lines after "-- "), and empty
- * leading/trailing lines.
+ * Normalize a reply body: drop the quoted original, reply separators, and
+ * signatures, keeping only what the user actually typed.
  */
 export function normalizeReply(rawBody) {
   const lines = String(rawBody || "").split(/\r?\n/);
   const kept = [];
   for (const line of lines) {
     const trimmed = line.trim();
-    // 常见引用分隔：邮件客户端的分隔线（如 163 的 "---- 回复的原邮件 ----"）
-    if (/^[-—–_]{3,}/.test(trimmed)) break;
+    if (/^[-—–_]{3,}/.test(trimmed)) break;               // 分隔线（163/飞书常见）
     if (/^----/.test(trimmed)) break;
-    if (/^>/.test(line)) break;
+    if (/^>/.test(line)) break;                            // 引用
     if (/^On .+wrote:$/i.test(line)) break;
-    if (/^在 .+写道：$/.test(line)) break;
+    if (/^在 .+写道[:：]\s*$/.test(trimmed)) break;
     if (/^发件人[:：]|^收件人[:：]|^抄送[:：]|^主题[:：]|^日期[:：]/.test(trimmed) && kept.length > 0) break;
-    if (trimmed === "--") break;
+    if (trimmed === "--") break;                           // 签名分隔
     kept.push(line);
   }
   return kept.join("\n").trim();
@@ -159,10 +183,14 @@ export function normalizeReply(rawBody) {
 
 /**
  * Poll the inbox once for replies matching pending decision ids.
- * @param config - { host, port, secure, user, pass, mailbox? }.
- * @param pendingIds - array of decision ids to look for.
- * @param opts - { sinceDays?, rejectUnauthorized?, timeoutMs? }.
- * @returns array of { id, subject, from, text } for matched replies.
+ *
+ * 只读最近 `maxMessages` 封（默认 50），并且跳过已读标记之外的历史邮件；
+ * 早期版本每次拉 100 封全文，邮箱一大就明显拖慢。
+ *
+ * @param config - { host, port, secure, user, pass, mailbox?, maxMessages? }.
+ * @param pendingIds - decision ids to look for.
+ * @param opts - { rejectUnauthorized?, timeoutMs?, maxMessages? }.
+ * @returns array of { id, uid, subject, from, text } for matched replies.
  */
 export async function pollReplies(config, pendingIds, opts = {}) {
   if (!config?.host || !config?.user || !config?.pass) {
@@ -175,8 +203,8 @@ export async function pollReplies(config, pendingIds, opts = {}) {
     ImapFlow = await loadImapFlow();
   } catch (error) {
     throw new Error(
-      `imap: 缺少可选依赖 imapflow（${error instanceof Error ? error.message : String(error)}）；` +
-      `请在 DSH profile 里安装它（pnpm add imapflow），或关闭 imap 配置。`,
+      `imap: 缺少可选依赖 imapflow（${error instanceof Error ? error.message : String(error)}）；`
+      + "请在 DSH profile 里安装它（pnpm add imapflow），或去掉 imap 配置。",
     );
   }
 
@@ -185,7 +213,7 @@ export async function pollReplies(config, pendingIds, opts = {}) {
     port: config.port ?? 993,
     secure: config.secure ?? true,
     auth: { user: config.user, pass: config.pass },
-    tls: { rejectUnauthorized: opts.rejectUnauthorized ?? true },
+    tls: { rejectUnauthorized: opts.rejectUnauthorized ?? config.rejectUnauthorized ?? true },
     logger: false,
     timeout: opts.timeoutMs ?? 30000,
   });
@@ -197,22 +225,19 @@ export async function pollReplies(config, pendingIds, opts = {}) {
     const mailbox = await client.mailboxOpen(config.mailbox ?? "INBOX");
     if (!mailbox || mailbox.exists === 0) return [];
 
-    // 直接取全部邮件并按主题过滤（不依赖 search 的 UID 语义，最稳）。
-    // 收件箱通常很小；如需控制量可配置 maxMessages。
-    const maxMessages = opts.maxMessages ?? 100;
+    // 从新往旧取最近 N 封；不依赖 search 的 UID 语义，最稳。
+    const maxMessages = opts.maxMessages ?? config.maxMessages ?? 50;
     const range = mailbox.exists > maxMessages ? `${mailbox.exists - maxMessages + 1}:*` : "1:*";
 
     for await (const message of client.fetch(range, { uid: true, envelope: true, source: true })) {
       const id = extractDecisionId(message.envelope?.subject);
       if (id === undefined || !wanted.has(id)) continue;
-      const raw = message.source;
-      const body = extractBody(raw);
       found.push({
         id,
         uid: message.uid,
         subject: message.envelope?.subject ?? "",
-        from: message.envelope?.from?.map((a) => a.address).filter(Boolean).join(", ") ?? "",
-        text: normalizeReply(body),
+        from: message.envelope?.from?.map((address) => address.address).filter(Boolean).join(", ") ?? "",
+        text: normalizeReply(extractBody(message.source)),
       });
     }
     return found;

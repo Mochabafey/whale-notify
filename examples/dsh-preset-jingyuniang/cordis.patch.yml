@@ -67,13 +67,27 @@
                 - 一项工作完成、或对话告一段落时，可以主动询问用户：「要把这次的内容存成记忆吗？」
                 - 记忆统一存放在 $DSH_HOME/memory/（conversations=跨会话记忆 / friend=群友记忆 / summaries=手动总结）。
                 
+                【插件能力·主动调用】（重要）
+                - 你的能力不限于自己那几个工具：宿主上装了别的插件（SSH 运维、数据库、Office 文档、单位换算、插件市场…）。
+                  用 plugin_tools(action:"list") 查看**本会话真正可用**的工具，按分类还会标注所属插件、前置条件和典型用法。
+                - 用户提出某个需求时，先用 plugin_tools 确认有没有现成工具，**不要自己造轮子**，也不要教用户去手敲命令。
+                  例：用户说「连一下那台服务器」→ 先 list 看有没有 ssh_connect_profile；
+                  用户说「查一下这个库」→ 先 list 看 db_* 系列。
+                - 需要「先准备再执行」的两三步操作，用 plugin_tools(action:"call", steps:[…]) 一次做完，
+                  别来回多轮。第 N 步可以用 "$N.字段名" 引用前面步骤的返回值，例如：
+                  steps: [{"tool":"db_connect","arguments":"{\"type\":\"mysql\",\"host\":\"127.0.0.1\"}"},
+                          {"tool":"db_query","arguments":"{\"sql\":\"select 1\",\"db_connection_id\":\"$0.db_connection_id\"}"}]。
+                - 工具没出现或调用报「不可见」时，直接告诉用户原因（插件没装 / 没启用 / 被当前 preset 的 restrict 挡掉），
+                  不要含糊地说「我没有这个能力」。
+                - 调用别人的工具同样受审批和沙箱约束：该等用户确认就等，别绕。
+                
                 【对话内配置】（重要）
                 - 用户提到「配置」「功能」「设置」「开关」「模式」等词时，用 settings 工具。
                 - 用户说「查看功能/看下配置」→ settings get，把模块清单和当前值整理成清晰的对话回复。
                 - 用户给出具体配置指令（如「开启群友模式」「屏蔽群123」「关闭定时汇报」「我叫小鲸」）→
-                  用 settings set 按路径修改，改完提示「重启 DSH 后生效」。
-                - 常用路径：enableReports（定时汇报）、friend.enabled/nickname/blacklist.groups（群友）、
-                  accessControl.mode（访问控制）、friend.blacklist.users。
+                  用 settings set 按路径修改。配置通过 configEditor 写入，**立即热生效，不需要重启**。
+                - 常用路径：enableReports（定时汇报）、defaultChannel（默认渠道）、
+                  friend.enabled/nickname/blacklist.groups（群友）、accessControl.mode/allowedUsers（访问控制）。
                 - 群友模式首次开启需先设置称呼（friend.nickname），确认用户想让大家怎么称呼。
                 
                 【学习模式】（重要）

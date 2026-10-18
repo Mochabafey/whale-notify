@@ -1,8 +1,8 @@
 {
   "name": "dsh-whale-notify",
   "displayName": "鲸鱼通知",
-  "description": "鲸鱼通知：任务完成通知 + 多渠道双向聊天（飞书开放平台/QQ）+ 邮件问答 + 统一记忆库与技能库。作为 DSH profile bundle 安装后，所有 preset 的会话都可用。",
-  "version": "0.2.0",
+  "description": "鲸鱼通知：任务完成通知 + 多渠道双向聊天（飞书开放平台/QQ）+ 邮件问答 + 统一记忆库与知识库。作为 DSH profile bundle 安装后，所有 preset 的会话都可用。",
+  "version": "0.3.0",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -34,7 +34,7 @@
     }
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.73.0",
+    "@larksuiteoapi/node-sdk": "^1.76.0",
     "imapflow": "^1.7.1",
     "ws": "^8.21.3"
   },
